@@ -1,0 +1,72 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Configuration and credentials
+# IMPORTANT: Do NOT commit real service accounts, API keys, or secrets
+# Use *.example.json files for templates instead
+config/service-account.json
+config/*.json
+!config/*.example.json
+.gcp/
+
+# Logs and data
+logs/
+*.log
+data/
+*.db
+*.sqlite
+
+# Streamlit cache
+.streamlit/
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Python package files
+*.egg-info/
+dist/
+build/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# BigQuery mock data
+bigquery-emulator/
+
+# Custom
+.claude/
+.claude_code/
+.git-hooks/
+shared/
