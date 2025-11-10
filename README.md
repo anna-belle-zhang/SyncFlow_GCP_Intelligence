@@ -435,6 +435,174 @@ Three agents run in parallel via `MultiAgentAnalyzer`:
 
 Each agent is independent and returns structured results that can be correlated.
 
+### ADK Architect Agent: Dual-Agent Communication Pattern
+
+The **Architect Agent** (`backend/agents/architect_agent_adk.py`) implements a sophisticated dual-agent system where two specialized AI agents collaborate to complete architecture analysis and proposal workflows:
+
+#### Two Specialized Agents
+
+**1. InventoryAnalystAgent (Read-Only)** - Analysis & Proposal Generation
+- Analyzes current GCP inventory and object configurations
+- Identifies critical dependencies and risk patterns
+- Generates 3-5 optimization proposals for each object
+- Recommends prioritized options for architect review
+
+**2. ArchitectProposalAgent (Write-Enabled)** - Decision Execution
+- Presents analyzed proposals to human architect for review
+- Records architect decisions and approval feedback
+- Implements approved proposals into BigQuery
+- Maintains complete audit trail of all decisions
+
+#### Communication Workflow
+
+The two agents communicate through a structured 5-step workflow orchestrated by `ArchitectWorkflow`:
+
+```
+STEP 1: INVENTORY ANALYSIS (InventoryAnalystAgent)
+  ↓
+  Load GCP objects, get priorities, identify unreviewed items
+  Uses: load_gcp_inventory(), get_priority_summary(), get_unreviewed_objects()
+
+STEP 2: DEPENDENCY ANALYSIS (InventoryAnalystAgent)
+  ↓
+  Analyze critical paths, upstream/downstream dependencies
+  Uses: analyze_lineage_upstream(), analyze_lineage_downstream(), extract_critical_paths()
+
+STEP 3: PROPOSAL GENERATION (InventoryAnalystAgent)
+  ↓
+  Generate 3-5 options per object: consolidation, optimization, decommission
+  Uses: generate_consolidation_proposal(), generate_optimization_proposal(),
+        generate_decommission_proposal()
+
+STEP 4: PROPOSAL RANKING (InventoryAnalystAgent)
+  ↓
+  Prioritize proposals by impact, cost, effort, risk
+  Uses: analyze_proposal_impact(), prioritize_proposals()
+  Output: ArchitectWorkflowResponse with ranked proposals
+
+STEP 5: ARCHITECT REVIEW (ArchitectProposalAgent)
+  ↓
+  Human architect (or system) reviews and approves proposals
+  Agent collects decisions: priority assignment, approval/rejection
+  Uses: collect_review()
+
+STEP 6: IMPLEMENTATION (ArchitectProposalAgent)
+  ↓
+  Apply approved decisions to BigQuery
+  Uses: update_object_priority(), create_lineage_edge(),
+        mark_for_decommission(), store_architecture_diagram()
+  Output: Updated object state, audit trail entries
+```
+
+#### Data Flow Between Agents
+
+```
+InventoryAnalystAgent                  ArchitectProposalAgent
+       ↓                                      ↑
+  Inventory Analysis                    Review Decisions
+       ↓                                      ↑
+  Dependency Analysis                   Collect Approval
+       ↓                                      ↑
+  [ArchitectProposal objects]     ←→    [ArchitectReview objects]
+       ↓                                      ↑
+  Proposal Ranking                      Implementation
+       ↓                                      ↑
+  [ArchitectWorkflowResponse]     ←→    [Update Results & Audit Log]
+```
+
+#### Key Features
+
+**Separation of Concerns**:
+- Analyst agent only reads from BigQuery (safe, cacheable analysis)
+- Proposal agent only writes approved changes (controlled modifications)
+- Prevents accidental data mutation during analysis phase
+
+**Proposal-Based Decision Making**:
+- Analyst generates multiple options with impact metrics
+- Architect chooses preferred option (human-in-the-loop)
+- Proposal agent implements only approved changes
+
+**Complete Audit Trail**:
+- Every decision recorded with architect name, timestamp, and reasoning
+- All changes tracked in `architect_audit_log` table
+- Full history enables rollback and decision review
+
+**Rich Proposal Models** (from `models_adk.py`):
+- `ArchitectProposal` - Base proposal with ID, type, status, cost/effort
+- `ConsolidationProposal` - Merge multiple objects with strategy
+- `OptimizationProposal` - Improve specific object (caching, sizing, etc.)
+- `DecommissionProposal` - Remove unused objects with replacement plan
+- `ImpactAnalysis` - Cost, latency, availability, risk metrics per proposal
+
+#### Example: Complete Workflow
+
+```python
+# Create workflow orchestrator
+workflow = ArchitectWorkflow(
+    project_id="prismatic-smoke-463810-c1",
+    dataset_id="minietl"
+)
+
+# Request architect review for HIGH priority objects
+request = ArchitectWorkflowRequest(
+    workflow_id="ARCH_20250110_001",
+    focus_priority=Priority.HIGH
+)
+
+# Start dual-agent workflow
+response = workflow.start_workflow(request)
+# → Step 1-5 execute automatically
+# → analyst generates proposals, returns ranked options
+
+# Architect reviews and approves
+workflow.apply_architect_decision(
+    object_id="OBJ0042",
+    priority=Priority.CRITICAL,
+    architect_name="alice@company.com",
+    notes="Core data pipeline - increase monitoring"
+)
+# → proposal_agent records decision in audit log
+# → proposal_agent updates BigQuery object record
+
+# Or implement decommission proposal
+workflow.mark_object_for_decommission(
+    object_id="OBJ0089",
+    reason="Replaced by newer OBJ0102",
+    replacement_id="OBJ0102",
+    architect_name="bob@company.com"
+)
+# → proposal_agent marks object deprecated
+# → audit trail records replacement mapping
+```
+
+#### Agent Tools Organization
+
+The agents access tools through a modular structure:
+
+**Inventory Tools** (`inventory_tools_standalone.py`):
+- `load_gcp_inventory()` - Fetch all objects with metadata
+- `get_unreviewed_objects()` - Filter objects pending architect review
+- `analyze_object_dependencies()` - Count upstream/downstream connections
+
+**Lineage Tools** (`lineage_tools_adk.py`):
+- `analyze_lineage_upstream()` - Trace data sources
+- `analyze_lineage_downstream()` - Trace data consumers
+- `build_lineage_graph()` - Create complete dependency graph
+- `extract_critical_paths()` - Identify mission-critical chains
+
+**Proposal Tools** (`proposal_tools.py`):
+- `generate_consolidation_proposal()` - Merge similar objects
+- `generate_optimization_proposal()` - Size, cache, schedule improvements
+- `generate_decommission_proposal()` - Plan object removal
+- `analyze_proposal_impact()` - Calculate cost/performance metrics
+- `prioritize_proposals()` - Rank by ROI and risk
+
+**Update Tools** (`update_tools.py`):
+- `update_object_priority()` - Set CRITICAL/HIGH/MEDIUM/LOW/DECOMMISSION
+- `create_lineage_edge()` - Add dependencies between objects
+- `mark_for_decommission()` - Flag object for removal with reason
+- `store_architecture_diagram()` - Save Mermaid diagram for visualization
+
 ## Code Style & Standards
 
 - **Python**: 3.10+ with 4-space indentation
