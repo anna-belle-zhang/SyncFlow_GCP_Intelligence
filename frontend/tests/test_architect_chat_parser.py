@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 from dashboard import (
     parse_architect_commands,
     build_mermaid_from_path,
+    merge_mermaid_diagrams,
 )  # noqa: E402
 
 
@@ -55,5 +56,51 @@ def test_build_mermaid_from_path():
     diagram = build_mermaid_from_path("obj001 -> obj002 -> obj007")
     assert diagram is not None
     assert "flowchart TD" in diagram
-    assert "OBJ001" in diagram
-    assert "OBJ001 --> OBJ002" in diagram
+    assert "OBJ0001" in diagram
+    assert "OBJ0001 --> OBJ0002" in diagram
+
+
+def test_merge_mermaid_diagrams_appends_without_overwrite():
+    base = """flowchart TD
+OBJ0002["OBJ0002"]
+OBJ0004["OBJ0004"]
+OBJ0020["OBJ0020"]
+OBJ0002 --> OBJ0004
+"""
+    addition = """flowchart TD
+OBJ0020["OBJ0020"]
+OBJ0022["OBJ0022"]
+OBJ0020 --> OBJ0022
+"""
+    merged = merge_mermaid_diagrams(base, addition)
+    assert merged.startswith("flowchart TD")
+    assert merged.count('OBJ0020["OBJ0020"]') == 1
+    assert "OBJ0002 --> OBJ0004" in merged
+    assert "OBJ0020 --> OBJ0022" in merged
+    assert 'OBJ0022["OBJ0022"]' in merged
+
+
+def test_build_mermaid_from_path_handles_after_instructions():
+    diagram = build_mermaid_from_path("add 0021 after 0008")
+    assert diagram is not None
+    assert "OBJ0008" in diagram
+    assert "OBJ0021" in diagram
+    assert "OBJ0008 -->" in diagram
+
+
+def test_merge_mermaid_diagrams_normalizes_zero_prefix_ids():
+    base = """flowchart TD
+0BJ0020["0BJ0020\\nlegacy"]
+OBJ0004["OBJ0004"]
+OBJ0004 --> 0BJ0020
+"""
+    addition = """flowchart TD
+OBJ0020["OBJ0020"]
+OBJ0021["OBJ0021"]
+OBJ0020 --> OBJ0021
+"""
+    merged = merge_mermaid_diagrams(base, addition)
+    assert merged.count('OBJ0020["') == 1
+    assert 'OBJ0004 --> OBJ0020' in merged
+    assert '0BJ0020 -->' not in merged
+    assert 'OBJ0020 --> OBJ0021' in merged

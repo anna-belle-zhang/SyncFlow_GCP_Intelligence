@@ -313,6 +313,124 @@ class ArchitectWorkflowResponse(BaseModel):
 
 
 # ============================================================================
+# OPS AGENT MODELS (Performance & Reliability Intelligence)
+# ============================================================================
+
+class PerformanceMetric(BaseModel):
+    """Daily performance metrics for an object."""
+    run_date: str = Field(..., description="Date of metric (YYYY-MM-DD)")
+    object_id: str = Field(..., description="Object being measured")
+    executions: int = Field(..., description="Number of executions")
+    successful: int = Field(..., description="Number of successful executions")
+    failed: int = Field(..., description="Number of failed executions")
+    success_rate: float = Field(..., description="Success rate (0-1)")
+    avg_duration_seconds: float = Field(..., description="Average execution duration")
+    min_duration_seconds: float = Field(..., description="Minimum execution duration")
+    max_duration_seconds: float = Field(..., description="Maximum execution duration")
+    duration_stddev: Optional[float] = Field(None, description="Standard deviation of duration")
+    total_rows_processed: int = Field(..., description="Total rows processed")
+    avg_throughput: float = Field(..., description="Average rows per execution")
+
+
+class AnomalyAlert(BaseModel):
+    """Performance anomaly detected by Ops Agent."""
+    anomaly_id: str = Field(..., description="Unique anomaly identifier")
+    object_id: str = Field(..., description="Object with anomaly")
+    anomaly_type: str = Field(..., description="Type: PERFORMANCE_DEGRADATION, HIGH_FAILURE_RATE, etc.")
+    severity: str = Field(..., description="CRITICAL, HIGH, MEDIUM, LOW")
+    metric_name: str = Field(..., description="Metric with anomaly (duration, success_rate, etc.)")
+    baseline_value: float = Field(..., description="Expected/baseline value")
+    observed_value: float = Field(..., description="Actually observed value")
+    deviation_stddev: float = Field(..., description="Number of standard deviations from baseline")
+    detected_at: datetime = Field(default_factory=datetime.utcnow)
+    correlation_notes: Optional[str] = Field(None, description="Correlated events/changes")
+
+
+class OptimizationRecommendation(BaseModel):
+    """Ops Agent recommendation for optimization."""
+    recommendation_id: str = Field(..., description="Unique recommendation ID")
+    object_id: str = Field(..., description="Object to optimize")
+    recommendation_type: str = Field(..., description="Type: SCALING, TIMEOUT_INCREASE, RETRY_POLICY, etc.")
+    current_state: str = Field(..., description="Current configuration")
+    recommended_state: str = Field(..., description="Recommended configuration")
+    rationale: str = Field(..., description="Why this recommendation")
+    expected_improvement_pct: float = Field(..., description="Expected improvement percentage")
+    confidence: float = Field(default=0.8, description="Confidence level (0-1)")
+    implementation_effort: str = Field(..., description="TRIVIAL, EASY, MODERATE, COMPLEX")
+
+
+class OpsAnalysis(BaseModel):
+    """Complete Ops Agent analysis result."""
+    object_id: str = Field(..., description="Analyzed object")
+    analysis_type: str = Field(default="Performance Analysis")
+    daily_metrics: List[PerformanceMetric] = Field(default_factory=list, description="Daily metrics")
+    trend_improvement_percent: float = Field(0.0, description="Trend % improvement vs time")
+    anomalies_detected: List[AnomalyAlert] = Field(default_factory=list, description="Detected anomalies")
+    recommendations: List[OptimizationRecommendation] = Field(default_factory=list)
+    sla_compliance_percent: float = Field(100.0, description="SLA compliance percentage")
+    portfolio_summary: List[Dict[str, Any]] = Field(default_factory=list, description="Top executing objects")
+    analyzed_at: datetime = Field(default_factory=datetime.utcnow)
+    lookback_days: int = Field(7, description="Analysis period in days")
+
+    class Config:
+        use_enum_values = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v else None
+        }
+
+
+# ============================================================================
+# FINOPS AGENT MODELS (Cost Optimization & Analytics)
+# ============================================================================
+
+class BillingTrend(BaseModel):
+    """Daily cost trend for an object."""
+    cost_date: str = Field(..., description="Date (YYYY-MM-DD)")
+    object_id: str = Field(..., description="Object being measured")
+    service: str = Field(..., description="GCP service (Dataflow, BigQuery, etc.)")
+    daily_cost_usd: float = Field(..., description="Cost for the day in USD")
+    compute_units: Optional[float] = Field(None, description="Compute units consumed")
+    slot_hours: Optional[float] = Field(None, description="BigQuery slot hours")
+
+
+class SavingsOpportunity(BaseModel):
+    """Cost savings opportunity identified by FinOps Agent."""
+    opportunity_id: str = Field(..., description="Unique opportunity ID")
+    object_id: str = Field(..., description="Object affected")
+    service: str = Field(..., description="GCP service")
+    opportunity_type: str = Field(..., description="Type: PARTITIONING, ARCHIVE, RIGHT_SIZING, COMMITMENT, etc.")
+    current_cost_monthly_usd: float = Field(..., description="Current monthly cost")
+    projected_cost_monthly_usd: float = Field(..., description="Cost after optimization")
+    monthly_savings_usd: float = Field(..., description="Potential monthly savings")
+    savings_pct: float = Field(..., description="Savings percentage")
+    implementation_effort: str = Field(..., description="TRIVIAL, EASY, MODERATE, COMPLEX")
+    roi_months: float = Field(..., description="Return on investment in months")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Optimization details")
+
+
+class CostAnalysis(BaseModel):
+    """Complete FinOps Agent cost analysis."""
+    object_id: str = Field(..., description="Analyzed object")
+    analysis_type: str = Field(default="Cost Analysis & Optimization")
+    cost_data: List[BillingTrend] = Field(default_factory=list, description="Daily cost trends")
+    total_cost_period_usd: float = Field(..., description="Total cost for period")
+    avg_daily_cost_usd: float = Field(..., description="Average daily cost")
+    savings_opportunity_percent: float = Field(0.0, description="Potential savings percentage")
+    estimated_daily_savings_usd: float = Field(0.0, description="Estimated daily savings")
+    opportunities: List[SavingsOpportunity] = Field(default_factory=list, description="Cost savings opportunities")
+    service_breakdown: Dict[str, float] = Field(default_factory=dict, description="Cost by service")
+    portfolio_summary: List[Dict[str, Any]] = Field(default_factory=list, description="Top cost objects")
+    analyzed_at: datetime = Field(default_factory=datetime.utcnow)
+    lookback_days: int = Field(30, description="Analysis period in days")
+
+    class Config:
+        use_enum_values = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat() if v else None
+        }
+
+
+# ============================================================================
 # DATABASE SCHEMA EXTENSIONS
 # ============================================================================
 

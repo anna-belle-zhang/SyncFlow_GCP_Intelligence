@@ -16,37 +16,83 @@ import json
 import logging
 import re
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
-from datetime import datetime, timedelta
+from datetime import datetime, date
+from statistics import mean, pstdev
 from uuid import uuid4
-from functools import lru_cache
+from collections import defaultdict
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from google.oauth2 import service_account
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 
 # Import Mini ETL modules
-from bigquery_loader import BigQueryManager, setup_from_service_account
-from billing_extractor import BillingExtractor
-from logs_explorer import LogsExplorer, LogFilter
-from architect_agent import ArchitectAgent
+# Use try/except for both relative and absolute imports (works both locally and in container)
 try:
-    from agents.architect_agent_adk import (
+    from .bigquery_loader import BigQueryManager, setup_from_service_account
+except ImportError:
+    from bigquery_loader import BigQueryManager, setup_from_service_account
+
+# Placeholder imports for missing modules
+BillingExtractor = None
+LogsExplorer = None
+LogFilter = None
+
+# ADK optional agents
+try:
+    from .agents.architect_agent_adk import (
+        ArchitectWorkflow,
         create_architect_workflow,
         start_architect_review,
     )
-    from agents.models_adk import Priority as ArchitectPriority
+    from .agents.models_adk import (
+        Priority as ArchitectPriority,
+        ArchitectWorkflowRequest,
+        ArchitectWorkflowResponse,
+    )
 except ImportError:
-    # ADK agents optional - continue without them
-    create_architect_workflow = None
-    start_architect_review = None
-    ArchitectPriority = None
+    try:
+        from agents.architect_agent_adk import (
+            ArchitectWorkflow,
+            create_architect_workflow,
+            start_architect_review,
+        )
+        from agents.models_adk import (
+            Priority as ArchitectPriority,
+            ArchitectWorkflowRequest,
+            ArchitectWorkflowResponse,
+        )
+    except ImportError:
+        # ADK agents optional - continue without them
+        ArchitectWorkflow = None
+        create_architect_workflow = None
+        start_architect_review = None
+        ArchitectPriority = None
+        ArchitectWorkflowRequest = None
+        ArchitectWorkflowResponse = None
 
-from app.storage.bigquery import BigQueryStorage, StorageError, NotFoundError
+# Gemini-enhanced architect agent
+try:
+    from .agents.architect_agent_gemini_enhanced import ArchitectAgentGeminiEnhanced
+except ImportError:
+    try:
+        from agents.architect_agent_gemini_enhanced import ArchitectAgentGeminiEnhanced
+    except ImportError:
+        # Gemini agent optional - continue without it
+        ArchitectAgentGeminiEnhanced = None
+
+try:
+    from .app.storage.bigquery import BigQueryStorage, StorageError, NotFoundError
+except ImportError:
+    from app.storage.bigquery import BigQueryStorage, StorageError, NotFoundError
+
+try:
+    from .app.api import register_blueprints as register_v2_blueprints
+except ImportError:  # pragma: no cover - optional refactor modules
+    register_v2_blueprints = None
 
 if TYPE_CHECKING:
-    from app.core.config import AppSettings
+    from .app.core.config import AppSettings
 
 # Logging setup
 logging.basicConfig(
@@ -66,6 +112,55 @@ class MultiAgentAnalyzer:
         r'^\s*([A-Za-z0-9_]+)\s*\[\s*["\']?([^"\']*?)["\']?\s*\]'
     )
     OBJECT_ID_PATTERN = re.compile(r'\bOBJ(\d{1,6})\b', re.IGNORECASE)
+    SLA_PRIORITY_MINUTES = {
+        "CRITICAL": 15,
+        "HIGH": 20,
+        "MEDIUM": 30,
+        "LOW": 45,
+    }
+    SLA_FALLBACK_MINUTES = 30
+    SERVICE_RECOMMENDATION_HINTS = [
+        ("DATAFLOW", {
+            "action": "Tune Dataflow worker autoscaling/Streaming Engine and right-size worker memory for sustained jobs.",
+            "opportunity_type": "rightsizing",
+            "savings_pct": 0.18,
+        }),
+        ("DATAPROC", {
+            "action": "Shut down idle Dataproc clusters and migrate recurring jobs to scheduled batches.",
+            "opportunity_type": "consolidation",
+            "savings_pct": 0.2,
+        }),
+        ("BIGQUERY", {
+            "action": "Enable table partitioning/clustering and expire cold partitions to trim scanned bytes.",
+            "opportunity_type": "partitioning",
+            "savings_pct": 0.22,
+        }),
+        ("CLOUD FUNCTION", {
+            "action": "Right-size Cloud Functions memory/CPU and consolidate triggers onto Cloud Run jobs.",
+            "opportunity_type": "rightsizing",
+            "savings_pct": 0.15,
+        }),
+        ("CLOUD RUN", {
+            "action": "Switch to min=0 revisions or scale-to-zero services for spiky workloads.",
+            "opportunity_type": "optimization",
+            "savings_pct": 0.12,
+        }),
+        ("CLOUD SCHEDULER", {
+            "action": "Reduce redundant Cloud Scheduler triggers and aggregate maintenance jobs.",
+            "opportunity_type": "consolidation",
+            "savings_pct": 0.08,
+        }),
+        ("PUBSUB", {
+            "action": "Purge dead-letter topics and enforce retention policies to trim Pub/Sub spend.",
+            "opportunity_type": "archival",
+            "savings_pct": 0.1,
+        }),
+    ]
+    DEFAULT_SERVICE_RECOMMENDATION = {
+        "action": "Review resource sizing and storage policies; archive cold data and consolidate low-usage jobs.",
+        "opportunity_type": "optimization",
+        "savings_pct": 0.1,
+    }
 
     def __init__(self, bq_manager: BigQueryManager):
         self.bq_manager = bq_manager
@@ -339,6 +434,565 @@ class MultiAgentAnalyzer:
             "prompt_object_ids": prompt_ids,
         }
 
+    @staticmethod
+    def _date_to_iso(value: Any) -> Optional[str]:
+        """Convert supported date-like objects to ISO format."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        return str(value)
+
+    @staticmethod
+    def _metadata_to_dict(metadata: Any) -> Dict[str, Any]:
+        """Return metadata as a dictionary when possible."""
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+
+    def _determine_sla_target_seconds(self, snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Infer SLA target (in seconds) from metadata or priority."""
+        if not snapshot:
+            return self.SLA_FALLBACK_MINUTES * 60
+
+        metadata = self._metadata_to_dict(snapshot.get("metadata"))
+        lookup_keys = [
+            "sla_minutes",
+            "sla_target_minutes",
+            "target_runtime_minutes",
+            "target_duration_minutes",
+            "max_duration_minutes",
+        ]
+        for key in lookup_keys:
+            minutes = metadata.get(key)
+            if minutes is not None:
+                try:
+                    minutes_val = float(minutes)
+                except (TypeError, ValueError):
+                    continue
+                if minutes_val > 0:
+                    return minutes_val * 60
+
+        lookup_seconds = [
+            "sla_seconds",
+            "sla_target_seconds",
+            "target_runtime_seconds",
+            "max_duration_seconds",
+        ]
+        for key in lookup_seconds:
+            seconds = metadata.get(key)
+            if seconds is not None:
+                try:
+                    seconds_val = float(seconds)
+                except (TypeError, ValueError):
+                    continue
+                if seconds_val > 0:
+                    return seconds_val
+
+        sla_block = metadata.get("sla")
+        if isinstance(sla_block, dict):
+            minutes = sla_block.get("target_minutes") or sla_block.get("minutes")
+            seconds = sla_block.get("target_seconds") or sla_block.get("seconds")
+            if minutes:
+                try:
+                    return float(minutes) * 60
+                except (TypeError, ValueError):
+                    pass
+            if seconds:
+                try:
+                    return float(seconds)
+                except (TypeError, ValueError):
+                    pass
+
+        priority = (snapshot.get("priority") or "").upper()
+        priority_minutes = self.SLA_PRIORITY_MINUTES.get(priority)
+        minutes_fallback = priority_minutes or self.SLA_FALLBACK_MINUTES
+        return minutes_fallback * 60
+
+    def _annotate_ops_metrics(
+        self,
+        metrics: List[Dict[str, Any]],
+        sla_seconds: Optional[float],
+    ) -> Dict[str, float]:
+        """Enrich per-day metrics with derived stats."""
+        if not metrics:
+            return {"duration_baseline": 0.0, "duration_stddev": 0.0, "volume_baseline": 0.0}
+
+        duration_values = [
+            entry.get("avg_duration")
+            for entry in metrics
+            if entry.get("avg_duration") is not None
+        ]
+        duration_baseline = mean(duration_values) if duration_values else 0.0
+        duration_stddev = pstdev(duration_values) if len(duration_values) > 1 else 0.0
+
+        volume_values = [
+            entry.get("total_rows") or 0.0
+            for entry in metrics
+        ]
+        volume_baseline = mean(volume_values) if volume_values else 0.0
+
+        for entry in metrics:
+            executions = entry.get("executions") or 0
+            successes = entry.get("successful") or 0
+            success_rate = (successes / executions) if executions else None
+            failure_rate = (1 - success_rate) if success_rate is not None else None
+            if success_rate is not None:
+                entry["success_rate_pct"] = round(success_rate * 100, 2)
+            else:
+                entry["success_rate_pct"] = None
+            if failure_rate is not None:
+                entry["failure_rate_pct"] = round(failure_rate * 100, 2)
+            else:
+                entry["failure_rate_pct"] = None
+
+            avg_duration = entry.get("avg_duration") or 0.0
+            sigma_level = 0.0
+            if duration_stddev > 0:
+                sigma_level = (avg_duration - duration_baseline) / duration_stddev
+            entry["sigma_level"] = round(sigma_level, 2)
+
+            if sigma_level >= 2:
+                performance_status = "Slow (2σ+)"
+            elif sigma_level <= -2:
+                performance_status = "Fast"
+            elif duration_baseline and avg_duration > duration_baseline * 1.15:
+                performance_status = "Slightly Slow"
+            elif duration_baseline and avg_duration < duration_baseline * 0.85:
+                performance_status = "Slightly Fast"
+            else:
+                performance_status = "Normal"
+            entry["performance_status"] = performance_status
+
+            sla_breach = False
+            if sla_seconds and entry.get("max_duration"):
+                sla_breach = float(entry["max_duration"]) >= float(sla_seconds)
+            entry["sla_breach"] = sla_breach
+            entry["sla_target_seconds"] = sla_seconds
+            entry["run_date_str"] = self._date_to_iso(entry.get("run_date"))
+
+        return {
+            "duration_baseline": duration_baseline,
+            "duration_stddev": duration_stddev,
+            "volume_baseline": volume_baseline,
+        }
+
+    def _summarize_ops_metrics(
+        self,
+        metrics: List[Dict[str, Any]],
+        sla_seconds: Optional[float],
+        baselines: Dict[str, float],
+        diagram_network: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Produce Ops Agent summary insights (performance, anomalies, capacity)."""
+        if not metrics:
+            return {}
+
+        ordered = sorted(metrics, key=lambda entry: entry.get("run_date") or datetime.min)
+        duration_baseline = baselines.get("duration_baseline", 0.0)
+        duration_stddev = baselines.get("duration_stddev", 0.0)
+        row_baseline = baselines.get("volume_baseline", 0.0)
+
+        success_rates = [entry.get("success_rate_pct") or 0.0 for entry in ordered if entry.get("success_rate_pct") is not None]
+        throughput_values = [entry.get("avg_throughput") or 0.0 for entry in ordered]
+        execution_values = [entry.get("executions") or 0 for entry in ordered]
+
+        def avg(values: List[float]) -> float:
+            valid = [val for val in values if val is not None]
+            return round(mean(valid), 2) if valid else 0.0
+
+        half_index = max(1, len(ordered) // 2)
+        early_window = ordered[:half_index]
+        recent_window = ordered[-half_index:]
+
+        def window_avg(entries: List[Dict[str, Any]], field: str) -> float:
+            data = [entry.get(field) for entry in entries if entry.get(field) is not None]
+            return mean(data) if data else 0.0
+
+        duration_trend_pct = 0.0
+        if early_window and recent_window:
+            early_avg = window_avg(early_window, "avg_duration")
+            recent_avg = window_avg(recent_window, "avg_duration")
+            if early_avg > 0 and recent_avg:
+                duration_trend_pct = ((recent_avg - early_avg) / early_avg) * 100
+
+        throughput_trend_pct = 0.0
+        if early_window and recent_window:
+            early_throughput = window_avg(early_window, "avg_throughput")
+            recent_throughput = window_avg(recent_window, "avg_throughput")
+            if early_throughput:
+                throughput_trend_pct = ((recent_throughput - early_throughput) / early_throughput) * 100
+
+        anomalies = [
+            {
+                "run_date": entry.get("run_date_str"),
+                "avg_duration": entry.get("avg_duration"),
+                "executions": entry.get("executions"),
+                "total_rows": entry.get("total_rows"),
+                "sigma": entry.get("sigma_level"),
+            }
+            for entry in ordered
+            if entry.get("sigma_level", 0) >= 2
+        ]
+
+        reliability_incidents = [
+            {
+                "run_date": entry.get("run_date_str"),
+                "success_rate_pct": entry.get("success_rate_pct"),
+                "failures": (entry.get("executions") or 0) - (entry.get("successful") or 0),
+            }
+            for entry in ordered
+            if entry.get("success_rate_pct") is not None and entry.get("success_rate_pct") < 97.0
+        ]
+
+        sla_breaches = [
+            {
+                "run_date": entry.get("run_date_str"),
+                "max_duration": entry.get("max_duration"),
+            }
+            for entry in ordered
+            if entry.get("sla_breach")
+        ]
+
+        row_values = [entry.get("total_rows") or 0 for entry in ordered]
+        row_threshold = row_baseline * 1.5 if row_baseline else None
+        bottlenecks: List[Dict[str, Any]] = []
+        for entry in ordered:
+            total_rows = entry.get("total_rows") or 0
+            avg_duration = entry.get("avg_duration") or 0
+            if row_threshold and total_rows >= row_threshold and avg_duration >= duration_baseline:
+                bottlenecks.append({
+                    "run_date": entry.get("run_date_str"),
+                    "reason": "Heavy upstream volume",
+                    "avg_duration": avg_duration,
+                    "total_rows": total_rows,
+                })
+        if not bottlenecks and anomalies:
+            bottlenecks = anomalies[:2]
+
+        diagram_targets = []
+        if diagram_network:
+            edges = diagram_network.get("edges") or []
+            diagram_targets = sorted({edge.get("target") for edge in edges if edge.get("target")})
+
+        capacity_forecast = {}
+        if execution_values:
+            exec_growth = 0.0
+            if len(execution_values) > 1:
+                exec_growth = (execution_values[-1] - execution_values[0]) / max(len(execution_values) - 1, 1)
+            projected_execs = max(execution_values[-1] + exec_growth * 14, 0)
+            avg_throughput = avg(throughput_values)
+            capacity_risk = "stable"
+            if duration_trend_pct > 10 or exec_growth > 0.5:
+                capacity_risk = "increasing"
+            if duration_trend_pct > 25 or exec_growth > 1:
+                capacity_risk = "at-risk"
+            capacity_forecast = {
+                "projected_execs_14d": round(projected_execs, 1),
+                "avg_throughput": round(avg_throughput, 2),
+                "trend_percent": round(duration_trend_pct, 2),
+                "risk_level": capacity_risk,
+            }
+
+        callouts: List[Dict[str, Any]] = []
+        if anomalies:
+            callouts.append({
+                "severity": "warning",
+                "message": f"{len(anomalies)} slow days exceeded 2σ baseline. Latest: {anomalies[-1]['run_date']}.",
+            })
+        if sla_breaches:
+            callouts.append({
+                "severity": "danger",
+                "message": f"SLA breached on {len(sla_breaches)} day(s); peak duration {max(b['max_duration'] or 0 for b in sla_breaches):.1f}s.",
+            })
+        if reliability_incidents:
+            callouts.append({
+                "severity": "warning",
+                "message": f"Reliability dips below 97% on {len(reliability_incidents)} day(s).",
+            })
+        if not callouts:
+            callouts.append({
+                "severity": "success",
+                "message": "Execution health stable — no anomalies detected.",
+            })
+
+        return {
+            "callouts": callouts,
+            "performance": {
+                "avg_duration": round(duration_baseline, 2),
+                "duration_trend_pct": round(duration_trend_pct, 2),
+                "avg_success_rate_pct": round(mean(success_rates), 2) if success_rates else None,
+                "throughput_trend_pct": round(throughput_trend_pct, 2),
+            },
+            "anomalies": anomalies,
+            "reliability": {
+                "incidents": reliability_incidents,
+                "worst_success_rate_pct": min(success_rates) if success_rates else None,
+            },
+            "sla": {
+                "target_seconds": sla_seconds,
+                "breaches": sla_breaches,
+            },
+            "capacity": capacity_forecast,
+            "bottlenecks": bottlenecks,
+            "diagram_targets": diagram_targets,
+        }
+
+    @staticmethod
+    def _ensure_date(value: Any) -> Optional[date]:
+        """Return a date object when possible."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return datetime.fromisoformat(str(value)).date()  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            return None
+
+    def _build_daily_cost_series(
+        self,
+        service_rows: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Aggregate per-service billing rows into daily totals + helper records."""
+        per_day: Dict[date, Dict[str, float]] = {}
+        for row in service_rows:
+            day = self._ensure_date(row.get("cost_date"))
+            if not day:
+                continue
+            entry = per_day.setdefault(day, {
+                "total_daily_cost": 0.0,
+                "total_compute_units": 0.0,
+                "total_slot_hours": 0.0,
+            })
+            entry["total_daily_cost"] += float(row.get("daily_cost") or 0.0)
+            entry["total_compute_units"] += float(row.get("compute_units") or 0.0)
+            entry["total_slot_hours"] += float(row.get("slot_hours") or 0.0)
+
+        if not per_day:
+            return [], []
+
+        rolling_costs: List[float] = []
+        daily_records: List[Dict[str, Any]] = []
+        for day in sorted(per_day.keys()):
+            entry = per_day[day]
+            rolling_costs.append(entry["total_daily_cost"])
+            if len(rolling_costs) > 7:
+                rolling_costs.pop(0)
+            avg_window = sum(rolling_costs) / len(rolling_costs)
+            record = {
+                "date": day,
+                "total_cost": entry["total_daily_cost"],
+                "avg_7day_cost": avg_window,
+                "compute_units": entry["total_compute_units"],
+                "slot_hours": entry["total_slot_hours"],
+            }
+            daily_records.append(record)
+
+        series: List[Dict[str, Any]] = []
+        for record in reversed(daily_records):
+            series.append({
+                "cost_date": record["date"].isoformat(),
+                "total_daily_cost": round(record["total_cost"], 2),
+                "avg_7day_cost": round(record["avg_7day_cost"], 2),
+                "total_compute_units": round(record["compute_units"], 2),
+                "total_slot_hours": round(record["slot_hours"], 2),
+            })
+
+        return series, daily_records
+
+    def _aggregate_service_costs(self, service_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Summarize spend by service."""
+        service_totals: Dict[str, Dict[str, Any]] = {}
+        for row in service_rows:
+            service_name = (row.get("service") or "UNKNOWN").strip() or "UNKNOWN"
+            key = service_name.upper()
+            day = self._ensure_date(row.get("cost_date"))
+            entry = service_totals.setdefault(key, {
+                "service": service_name,
+                "total_cost": 0.0,
+                "compute_units": 0.0,
+                "slot_hours": 0.0,
+                "active_days": set(),
+            })
+            entry["total_cost"] += float(row.get("daily_cost") or 0.0)
+            entry["compute_units"] += float(row.get("compute_units") or 0.0)
+            entry["slot_hours"] += float(row.get("slot_hours") or 0.0)
+            if day:
+                entry["active_days"].add(day)
+
+        breakdown: List[Dict[str, Any]] = []
+        for entry in service_totals.values():
+            active_days = len(entry["active_days"])
+            breakdown.append({
+                "service": entry["service"],
+                "total_cost": round(entry["total_cost"], 2),
+                "compute_units": round(entry["compute_units"], 2),
+                "slot_hours": round(entry["slot_hours"], 2),
+                "active_days": active_days,
+                "avg_daily_cost": round(
+                    entry["total_cost"] / active_days if active_days else entry["total_cost"],
+                    2,
+                ),
+            })
+
+        breakdown.sort(key=lambda item: item["total_cost"], reverse=True)
+        return breakdown
+
+    def _service_recommendation_for(self, service_name: str) -> Dict[str, Any]:
+        """Return optimization guidance for a given service name."""
+        upper = (service_name or "").upper()
+        for needle, payload in self.SERVICE_RECOMMENDATION_HINTS:
+            if needle in upper:
+                return payload
+        return self.DEFAULT_SERVICE_RECOMMENDATION
+
+    def _summarize_finops_metrics(
+        self,
+        service_rows: List[Dict[str, Any]],
+        daily_records: List[Dict[str, Any]],
+        lookback_days: int,
+    ) -> Dict[str, Any]:
+        """Produce FinOps summary insights: trends, drivers, recommendations."""
+        if not service_rows or not daily_records:
+            return {}
+
+        total_cost = sum(record["total_cost"] for record in daily_records)
+        avg_daily_cost = total_cost / len(daily_records) if daily_records else 0.0
+
+        service_breakdown = self._aggregate_service_costs(service_rows)
+        top_drivers = service_breakdown[:3]
+        for entry in service_breakdown:
+            percent = (entry["total_cost"] / total_cost * 100) if total_cost else 0.0
+            entry["percent_of_total"] = round(percent, 2)
+
+        monthly_totals: Dict[tuple[int, int], float] = defaultdict(float)
+        for record in daily_records:
+            day: date = record["date"]
+            monthly_totals[(day.year, day.month)] += record["total_cost"]
+        sorted_months = sorted(monthly_totals.keys())
+        mom_change_pct: Optional[float] = None
+        yoy_change_pct: Optional[float] = None
+        if len(sorted_months) >= 2:
+            latest = sorted_months[-1]
+            previous = sorted_months[-2]
+            latest_spend = monthly_totals[latest]
+            previous_spend = monthly_totals.get(previous)
+            if previous_spend:
+                mom_change_pct = ((latest_spend - previous_spend) / previous_spend) * 100
+            yoy_key = (latest[0] - 1, latest[1])
+            baseline = monthly_totals.get(yoy_key)
+            if baseline:
+                yoy_change_pct = ((latest_spend - baseline) / baseline) * 100
+
+        callouts: List[Dict[str, Any]] = []
+        if mom_change_pct is not None:
+            if mom_change_pct > 15:
+                callouts.append({
+                    "severity": "danger",
+                    "message": f"MoM spend up {mom_change_pct:.1f}% — investigate workload changes.",
+                })
+            elif mom_change_pct > 5:
+                callouts.append({
+                    "severity": "warning",
+                    "message": f"MoM spend up {mom_change_pct:.1f}%.",
+                })
+            elif mom_change_pct < -5:
+                callouts.append({
+                    "severity": "success",
+                    "message": f"MoM spend down {abs(mom_change_pct):.1f}% after optimizations.",
+                })
+        if yoy_change_pct is not None and yoy_change_pct > 10:
+            callouts.append({
+                "severity": "warning",
+                "message": f"YoY spend trending {yoy_change_pct:.1f}% higher.",
+            })
+
+        if top_drivers:
+            share = top_drivers[0]["percent_of_total"]
+            if share > 60:
+                callouts.append({
+                    "severity": "warning",
+                    "message": f"{top_drivers[0]['service']} contributes {share:.1f}% of cost — single-service risk.",
+                })
+
+        if not callouts:
+            callouts.append({
+                "severity": "info",
+                "message": "Spend steady across monitored services.",
+            })
+
+        savings_opportunities: List[Dict[str, Any]] = []
+        recommendations: List[str] = []
+        for entry in top_drivers:
+            rec = self._service_recommendation_for(entry["service"])
+            savings_pct = rec.get("savings_pct", 0.1)
+            potential = entry["total_cost"] * savings_pct
+            opportunity = {
+                "service": entry["service"],
+                "opportunity_type": rec.get("opportunity_type"),
+                "potential_savings": round(potential, 2),
+                "action": rec.get("action"),
+            }
+            savings_opportunities.append(opportunity)
+            recommendations.append(f"{entry['service']}: {rec.get('action')}")
+
+        if mom_change_pct and mom_change_pct > 10:
+            recommendations.append("Enable budget alerts + anomaly detection for this object to cap MoM spikes.")
+        if yoy_change_pct and yoy_change_pct > 10:
+            recommendations.append("Review reservation commitments vs. on-demand usage to smooth YoY growth.")
+
+        # Deduplicate recommendations while preserving order
+        deduped_recommendations: List[str] = []
+        seen: set[str] = set()
+        for rec in recommendations:
+            if rec and rec not in seen:
+                deduped_recommendations.append(rec)
+                seen.add(rec)
+
+        total_potential = sum(item["potential_savings"] for item in savings_opportunities)
+
+        return {
+            "callouts": callouts,
+            "totals": {
+                "total_cost": round(total_cost, 2),
+                "avg_daily_cost": round(avg_daily_cost, 2),
+                "lookback_days": lookback_days,
+                "latest_daily_cost": round(daily_records[-1]["total_cost"], 2) if daily_records else 0.0,
+            },
+            "trend": {
+                "mom_change_pct": mom_change_pct,
+                "yoy_change_pct": yoy_change_pct,
+                "months_covered": len(sorted_months),
+            },
+            "service_breakdown": service_breakdown,
+            "drivers": [
+                {
+                    "service": entry["service"],
+                    "percent_of_total": entry.get("percent_of_total"),
+                    "total_cost": entry["total_cost"],
+                }
+                for entry in top_drivers
+            ],
+            "savings": {
+                "opportunities": savings_opportunities,
+                "total_potential": round(total_potential, 2),
+            },
+            "recommendations": deduped_recommendations,
+            "monitored_services": [entry["service"] for entry in service_breakdown[:6]],
+        }
+
     def doc_agent_analysis(self, object_id: str, prompt: Optional[str] = None) -> Dict[str, Any]:
         """
         DocAgent - Configuration Change Detection
@@ -503,6 +1157,72 @@ class MultiAgentAnalyzer:
             logger.error(f"DocAgent error: {e}")
             return {"error": str(e), "agent": "DocAgent"}
 
+    def architect_agent_adk_analysis(self, object_id: str) -> Dict[str, Any]:
+        """
+        ADK-based Architect Agent - Uses ArchitectWorkflow for structured analysis.
+
+        Runs the complete 5-stage workflow:
+        1. Analyze inventory
+        2. Analyze critical dependencies
+        3. Generate improvement options
+        4. Prioritize recommendations
+        5. Present proposals for architect review
+
+        Returns proposals with ROI analysis and implementation audit trail.
+        """
+        if not ArchitectWorkflow:
+            logger.warning("ArchitectWorkflow not available, falling back to DocAgent")
+            return self.doc_agent_analysis(object_id)
+
+        try:
+            logger.info(f"Architect ADK Agent analyzing {object_id}")
+
+            # Create workflow
+            workflow = ArchitectWorkflow(
+                project_id=self.bq_manager.project_id,
+                dataset_id=self.dataset_id
+            )
+
+            # Create request
+            request = ArchitectWorkflowRequest(
+                workflow_id=f"UI_{object_id}_{uuid4().hex[:8]}",
+                focus_priority=None,  # Analyze all priorities
+                requested_by="ui_dashboard"
+            )
+
+            # Execute workflow
+            response = workflow.start_workflow(request)
+
+            # Convert proposals to JSON-serializable format
+            proposals = []
+            if response.proposals:
+                for prop in response.proposals:
+                    proposals.append({
+                        "proposal_id": prop.proposal_id,
+                        "object_id": prop.object_id,
+                        "proposal_type": prop.proposal_type.value if hasattr(prop.proposal_type, 'value') else str(prop.proposal_type),
+                        "status": prop.status.value if hasattr(prop.status, 'value') else str(prop.status),
+                        "title": prop.title,
+                        "description": prop.description or prop.rationale,
+                        "priority": prop.priority.value if hasattr(prop.priority, 'value') else str(prop.priority),
+                    })
+
+            return {
+                "agent": "ArchitectADK",
+                "object_id": object_id,
+                "analysis_type": "Architecture Optimization (ADK Workflow)",
+                "workflow_id": response.workflow_id,
+                "status": response.status,
+                "inventory_summary": response.inventory_summary if response.inventory_summary else {},
+                "proposals": proposals,
+                "reviews_collected": response.reviews_collected,
+                "timestamp": datetime.now().isoformat()
+            }
+
+        except Exception as e:
+            logger.error(f"Architect ADK Agent error: {e}")
+            return {"error": str(e), "agent": "ArchitectADK"}
+
     def log_agent_analysis(self, object_id: str, days: int = 7, prompt: Optional[str] = None) -> Dict[str, Any]:
         """
         LogAgent - Performance Analysis & Anomaly Detection
@@ -542,36 +1262,23 @@ class MultiAgentAnalyzer:
                 normalized_id = None
 
         query = f"""
-        WITH daily_metrics AS (
-            SELECT
-                DATE(created_at) as run_date,
-                object_id,
-                COUNT(*) as executions,
-                COUNTIF(status = 'success') as successful,
-                AVG(duration_seconds) as avg_duration,
-                MIN(duration_seconds) as min_duration,
-                MAX(duration_seconds) as max_duration,
-                SUM(rows_processed) as total_rows,
-                AVG(rows_processed) as avg_throughput
-            FROM `{self.bq_manager.project_id}.{self.dataset_id}.factlog`
-            WHERE object_id = '{normalized_id}'
-                AND DATE(created_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
-            GROUP BY run_date, object_id
-        ),
-        anomalies AS (
-            SELECT
-                run_date,
-                object_id,
-                avg_duration,
-                PERCENTILE_CONT(avg_duration, 0.9) OVER () as p90_duration,
-                CASE
-                    WHEN avg_duration > PERCENTILE_CONT(avg_duration, 0.9) OVER () THEN 'Slow'
-                    WHEN avg_duration < PERCENTILE_CONT(avg_duration, 0.1) OVER () THEN 'Fast'
-                    ELSE 'Normal'
-                END as performance_status
-            FROM daily_metrics
-        )
-        SELECT * FROM anomalies ORDER BY run_date DESC
+        SELECT
+            DATE(created_at) as run_date,
+            object_id,
+            COUNT(*) as executions,
+            COUNTIF(status = 'success') as successful,
+            COUNTIF(status != 'success') as failed,
+            AVG(duration_seconds) as avg_duration,
+            MIN(duration_seconds) as min_duration,
+            MAX(duration_seconds) as max_duration,
+            STDDEV(duration_seconds) as duration_stddev,
+            SUM(rows_processed) as total_rows,
+            AVG(rows_processed) as avg_throughput
+        FROM `{self.bq_manager.project_id}.{self.dataset_id}.factlog`
+        WHERE object_id = '{normalized_id}'
+            AND DATE(created_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
+        GROUP BY run_date, object_id
+        ORDER BY run_date DESC
         """
 
         try:
@@ -581,6 +1288,22 @@ class MultiAgentAnalyzer:
                 metrics = [dict(row) for row in results]
             else:
                 logger.info("No execution records located for portfolio window.")
+
+            context: Dict[str, Any] = {}
+            additional_ids = [entry.get("object_id") for entry in portfolio_summary[1:]] if portfolio_summary else None
+            context = self._gather_architect_context(
+                normalized_id or object_id,
+                prompt,
+                additional_ids=additional_ids,
+            )
+            sla_seconds = self._determine_sla_target_seconds(context.get("snapshot"))
+            baselines = self._annotate_ops_metrics(metrics, sla_seconds)
+            ops_summary = self._summarize_ops_metrics(
+                metrics,
+                sla_seconds,
+                baselines,
+                context.get("diagram_network"),
+            ) if metrics else {}
 
             # Calculate trend
             if len(metrics) >= 2:
@@ -594,14 +1317,13 @@ class MultiAgentAnalyzer:
             else:
                 improvement_pct = 0
 
-            additional_ids = [entry.get("object_id") for entry in portfolio_summary[1:]] if portfolio_summary else None
-            context = self._gather_architect_context(normalized_id, prompt, additional_ids=additional_ids)
             return {
                 "agent": "LogAgent",
                 "object_id": normalized_id or object_id,
                 "analysis_type": "Performance Analysis",
                 "daily_metrics": metrics,
                 "trend_improvement_percent": round(improvement_pct, 1),
+                "ops_summary": ops_summary,
                 "portfolio_summary": portfolio_summary,
                 "object_snapshot": context.get("snapshot"),
                 "diagram_summary": context.get("diagram_summary"),
@@ -655,59 +1377,37 @@ class MultiAgentAnalyzer:
                 normalized_id = None
 
         query = f"""
-        WITH cost_metrics AS (
-            SELECT
-                DATE(run_date) as cost_date,
-                object_id,
-                service,
-                SUM(cost_usd) as daily_cost,
-                SUM(compute_units) as compute_units,
-                SUM(slot_hours) as slot_hours
-            FROM `{self.bq_manager.project_id}.{self.dataset_id}.factbilling`
-            WHERE object_id = '{normalized_id}' 
-                AND DATE(run_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
-            GROUP BY cost_date, object_id, service
-        ),
-        daily_total AS (
-            SELECT
-                cost_date,
-                object_id,
-                SUM(daily_cost) as total_daily_cost,
-                SUM(compute_units) as total_compute_units,
-                SUM(slot_hours) as total_slot_hours
-            FROM cost_metrics
-            GROUP BY cost_date, object_id
-        )
         SELECT
-            cost_date,
+            DATE(run_date) as cost_date,
             object_id,
-            total_daily_cost,
-            total_compute_units,
-            total_slot_hours,
-            ROUND(AVG(total_daily_cost) OVER (
-                ORDER BY cost_date
-                ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-            ), 2) as avg_7day_cost
-        FROM daily_total
-        ORDER BY cost_date DESC
+            service,
+            SUM(cost_usd) as daily_cost,
+            SUM(compute_units) as compute_units,
+            SUM(slot_hours) as slot_hours
+        FROM `{self.bq_manager.project_id}.{self.dataset_id}.factbilling`
+        WHERE object_id = '{normalized_id}'
+            AND DATE(run_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {lookback_days} DAY)
+        GROUP BY cost_date, object_id, service
+        ORDER BY cost_date DESC, service
         """
 
         try:
-            cost_data: List[Dict[str, Any]] = []
+            service_rows: List[Dict[str, Any]] = []
             if normalized_id:
                 results = self.client.query(query).result()
-                cost_data = [dict(row) for row in results]
+                service_rows = [dict(row) for row in results]
             else:
                 logger.info("No spend records located for aggregation window.")
 
-            # Calculate savings opportunity
-            if len(cost_data) >= 2:
-                first_week = cost_data[-7:] if len(cost_data) >= 7 else cost_data
-                recent = cost_data[:7] if len(cost_data) >= 7 else cost_data
+            daily_series, daily_records = self._build_daily_cost_series(service_rows)
+            finops_summary = self._summarize_finops_metrics(service_rows, daily_records, lookback_days)
 
+            # Calculate savings opportunity (legacy field retained for backward compatibility)
+            if len(daily_series) >= 2:
+                first_week = list(reversed(daily_series))[:7] if len(daily_series) >= 7 else list(reversed(daily_series))
+                recent = daily_series[:7] if len(daily_series) >= 7 else daily_series
                 cost_first = sum(c['total_daily_cost'] for c in first_week) / len(first_week) if first_week else 0
                 cost_recent = sum(c['total_daily_cost'] for c in recent) / len(recent) if recent else 0
-
                 savings_pct = ((cost_first - cost_recent) / cost_first * 100) if cost_first > 0 else 0
                 daily_savings = cost_first - cost_recent
             else:
@@ -720,9 +1420,10 @@ class MultiAgentAnalyzer:
                 "agent": "CloudFnOAgent",
                 "object_id": normalized_id or object_id,
                 "analysis_type": "Cost Analysis & Optimization",
-                "cost_data": cost_data[:14],  # Last 2 weeks
+                "cost_data": daily_series[:30],  # Up to last 30 days for charts
                 "savings_opportunity_percent": round(savings_pct, 1),
                 "estimated_daily_savings": round(daily_savings, 2),
+                "finops_summary": finops_summary,
                 "portfolio_summary": portfolio_summary,
                 "object_snapshot": context.get("snapshot"),
                 "diagram_summary": context.get("diagram_summary"),
@@ -738,9 +1439,101 @@ class MultiAgentAnalyzer:
             logger.error(f"CloudFnOAgent error: {e}")
             return {"error": str(e), "agent": "CloudFnOAgent"}
 
+    def synthesize_all_agents(
+        self,
+        object_id: str,
+        architect_analysis: Dict[str, Any],
+        ops_analysis: Dict[str, Any],
+        finops_analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Gemini Synthesis Layer - Combines all 3 agent insights into executive summary.
+
+        Takes the three specialized agent analyses and uses Gemini to:
+        1. Identify key findings from each perspective
+        2. Detect correlations (e.g., config change → performance degradation → cost spike)
+        3. Generate executive summary in plain English
+        4. Suggest actionable next steps
+        5. Quantify business impact
+        """
+        # Try both relative and absolute imports
+        try:
+            from .agents.architect_agent_gemini_enhanced import ArchitectAgentGeminiEnhanced
+        except ImportError:
+            try:
+                from agents.architect_agent_gemini_enhanced import ArchitectAgentGeminiEnhanced
+            except ImportError:
+                ArchitectAgentGeminiEnhanced = None
+
+        if not ArchitectAgentGeminiEnhanced:
+            logger.info("Gemini synthesis layer not available (google-genai not installed)")
+            return None
+
+        try:
+            # Format the context for Gemini
+            context_prompt = f"""
+            Analyze and synthesize these three specialist agent analyses for object {object_id}:
+
+            ARCHITECT INSIGHTS (Configuration & Lineage):
+            {json.dumps(architect_analysis, indent=2, default=str)}
+
+            OPS INSIGHTS (Performance & Reliability):
+            {json.dumps(ops_analysis, indent=2, default=str)}
+
+            FINOPS INSIGHTS (Cost & Optimization):
+            {json.dumps(finops_analysis, indent=2, default=str)}
+
+            Please provide:
+            1. Executive Summary (1-2 sentences of overall health)
+            2. Key Findings (3-5 bullet points combining all perspectives)
+            3. Correlations (if config change → perf impact → cost impact, note this)
+            4. Risk Assessment (low/medium/high)
+            5. Recommended Next Actions (prioritized)
+            6. Expected Business Impact (if recommendations are implemented)
+
+            Format as JSON with these exact keys:
+            - executive_summary
+            - key_findings (array)
+            - correlations (array)
+            - risk_level
+            - next_actions (array)
+            - business_impact
+            """
+
+            # If Gemini agent is available, use it
+            if hasattr(self, 'gemini_agent') and self.gemini_agent:
+                import asyncio
+                result = asyncio.run(
+                    self.gemini_agent.process_user_input(context_prompt)
+                )
+                if result and not result.get("error"):
+                    try:
+                        # Try to parse the response as JSON
+                        synthesis = json.loads(result.get("message", "{}"))
+                    except json.JSONDecodeError:
+                        # If not JSON, return as text summary
+                        synthesis = {
+                            "executive_summary": result.get("message", "Analysis synthesis unavailable"),
+                            "key_findings": [],
+                            "correlations": [],
+                            "risk_level": "unknown",
+                            "next_actions": [],
+                            "business_impact": "Unknown"
+                        }
+                    return synthesis
+            else:
+                logger.info("Gemini agent not initialized, synthesis skipped")
+                return None
+
+        except Exception as e:
+            logger.error(f"Synthesis layer error: {e}")
+            return None
+
 
 class SyncFlowApp:
     """Main application class integrating Mini ETL and Multi-Agent Architecture."""
+
+    ARCHITECT_ROLES = {"architect", "admin"}
 
     def __init__(
         self,
@@ -778,9 +1571,11 @@ class SyncFlowApp:
         self.logs_explorer = None
         self.analyzer = None
         self.billing_extractor = None
-        self.architect_agent = None
+        self.gemini_agent = None
 
         self._initialize_components()
+        if app is None:
+            self._register_v2_blueprints()
         self._register_routes()
 
     def _load_config(self, config_file: Optional[str]) -> Dict:
@@ -822,20 +1617,42 @@ class SyncFlowApp:
             self.storage = BigQueryStorage(self.bq_manager)
             self.app.extensions.setdefault("storage", self.storage)
 
-            self.logs_explorer = LogsExplorer(self.project_id, self.bq_manager.credentials)
+            # LogsExplorer and BillingExtractor modules not found - commented out
+            # self.logs_explorer = LogsExplorer(self.project_id, self.bq_manager.credentials)
+            self.logs_explorer = None
             self.analyzer = MultiAgentAnalyzer(self.bq_manager)
-            self.billing_extractor = BillingExtractor(
-                project_id=self.project_id,
-                dataset_id=self.dataset_id,
-                billing_project_id=self.project_id,
-                credentials=self.bq_manager.credentials,
-            )
-            self.architect_agent = ArchitectAgent(self.bq_manager)
+            # self.billing_extractor = BillingExtractor(
+            #     project_id=self.project_id,
+            #     dataset_id=self.dataset_id,
+            #     billing_project_id=self.project_id,
+            #     credentials=self.bq_manager.credentials,
+            # )
+            self.billing_extractor = None
+
+            # Initialize Gemini-enhanced architect agent (optional)
+            if ArchitectAgentGeminiEnhanced:
+                try:
+                    self.gemini_agent = ArchitectAgentGeminiEnhanced(self.bq_manager)
+                    logger.info("✓ Gemini-enhanced architect agent initialized")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Gemini agent (optional): {e}")
+                    self.gemini_agent = None
 
             logger.info(f"✓ Components initialized for project: {self.project_id}")
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
             raise
+
+    def _register_v2_blueprints(self):
+        """Attach /api/v2 blueprints when running the standalone server."""
+        if register_v2_blueprints is None:
+            logger.info("Skipping v2 blueprint registration (module unavailable).")
+            return
+        try:
+            register_v2_blueprints(self.app)
+            logger.info("✓ Registered /api/v2 blueprints.")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to register /api/v2 blueprints: {exc}")
 
     def _create_adk_workflow(self):
         """Create a new ADK architect workflow wired to the current project."""
@@ -851,6 +1668,18 @@ class SyncFlowApp:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
+
+    @staticmethod
+    def _request_role() -> str:
+        """Determine the caller role from headers."""
+        header = request.headers.get("X-Syncflow-Role") or request.headers.get("X-User-Role")
+        if not header:
+            return "viewer"
+        return header.strip().lower()
+
+    def _request_has_architect_role(self) -> bool:
+        """True when caller is allowed to mutate SCD2 tables."""
+        return self._request_role() in self.ARCHITECT_ROLES
 
     def _register_routes(self):
         """Register all API routes."""
@@ -973,9 +1802,20 @@ class SyncFlowApp:
         # ==== Multi-Agent Analysis ====
         @self.app.route('/api/agents/analyze/<object_id>', methods=['GET'])
         def analyze_object(object_id):
-            """Run all three agents on an object."""
+            """
+            Run all three agents on an object with optional Gemini synthesis.
+
+            Now uses:
+            - Architect: ADK Workflow (generates proposals + audit trail)
+            - Ops: Custom analysis (performance insights)
+            - FinOps: Custom analysis (cost insights)
+            - Synthesis: Gemini layer (correlates all 3 perspectives)
+            """
             try:
-                doc_analysis = self.analyzer.doc_agent_analysis(object_id)
+                # Phase 1: Run ADK-based Architect agent (with proposals)
+                architect_analysis = self.analyzer.architect_agent_adk_analysis(object_id)
+
+                # Phase 2: Run Ops and FinOps custom agents
                 log_analysis = self.analyzer.log_agent_analysis(
                     object_id,
                     int(request.args.get('days', 7))
@@ -985,12 +1825,28 @@ class SyncFlowApp:
                     int(request.args.get('cost_days', 30))
                 )
 
-                return jsonify({
+                # Phase 3: Synthesize all insights using Gemini (optional)
+                synthesis = self.analyzer.synthesize_all_agents(
+                    object_id,
+                    architect_analysis,
+                    log_analysis,
+                    cost_analysis
+                )
+
+                response_data = {
                     "object_id": object_id,
-                    "agents": [doc_analysis, log_analysis, cost_analysis],
+                    "agents": {
+                        "architect": architect_analysis,
+                        "ops": log_analysis,
+                        "finops": cost_analysis
+                    },
+                    "synthesis": synthesis,
                     "timestamp": datetime.now().isoformat()
-                })
+                }
+
+                return jsonify(response_data)
             except Exception as e:
+                logger.error(f"analyze_object failed: {e}")
                 return jsonify({"error": str(e)}), 500
 
         @self.app.route('/api/agents/doc/<object_id>', methods=['GET'])
@@ -1043,84 +1899,41 @@ class SyncFlowApp:
                 logger.error(f"FinOps agent failed: {e}")
                 return jsonify({"error": str(e)}), 500
 
-        # ==== Architect Agent - Inventory Review & Prioritization ====
-        @self.app.route('/api/objects/<object_id>/architect-review', methods=['POST'])
-        def architect_review(object_id):
-            """Submit architect review for an object."""
+        # ==== Gemini-Enhanced Architect Agent ====
+        @self.app.route('/api/v2/agents/architect-gemini', methods=['POST'])
+        def architect_agent_gemini():
+            """Process object queries using Gemini for intelligent parsing."""
+            if not self.gemini_agent:
+                return jsonify({
+                    "error": "Gemini agent not initialized",
+                    "message": "google-genai not installed or API key not set"
+                }), 503
+
             try:
-                data = request.get_json()
+                data = request.get_json() or {}
+                user_message = data.get('message') or data.get('query')
 
-                # Validate required fields
-                if not data:
-                    return jsonify({"error": "Request body required"}), 400
-
-                priority = data.get('priority')
-                architect_notes = data.get('architect_notes', '')
-                is_decommission = data.get('is_decommission', False)
-                decommission_reason = data.get('decommission_reason')
-                reviewed_by = data.get('reviewed_by', 'web_user')
-
-                # Validate priority
-                valid_priorities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
-                if priority not in valid_priorities:
+                if not user_message:
                     return jsonify({
-                        "error": f"Invalid priority. Must be one of: {valid_priorities}"
+                        "error": "Missing required field",
+                        "message": "Please provide 'message' or 'query' field"
                     }), 400
 
-                # Call architect agent
-                result = self.architect_agent.review_object(
-                    object_id=object_id,
-                    priority=priority,
-                    architect_notes=architect_notes,
-                    is_decommission=is_decommission,
-                    decommission_reason=decommission_reason,
-                    reviewed_by=reviewed_by
+                # Process with Gemini agent (async in background)
+                import asyncio
+                result = asyncio.run(
+                    self.gemini_agent.process_user_input(user_message)
                 )
 
-                return jsonify(result), 200 if result.get('status') == 'success' else 400
-            except Exception as e:
-                logger.error(f"Architect review failed for {object_id}: {e}")
-                return jsonify({"error": str(e)}), 500
-
-        @self.app.route('/api/architect/priority-summary', methods=['GET'])
-        def architect_priority_summary():
-            """Get summary of objects by priority level."""
-            try:
-                summary = self.architect_agent.get_priority_summary()
                 return jsonify({
-                    "summary": summary,
+                    "agent": "ArchitectAgentGemini",
+                    "input": user_message,
+                    "result": result,
                     "timestamp": datetime.now().isoformat()
                 })
-            except Exception as e:
-                logger.error(f"Priority summary failed: {e}")
-                return jsonify({"error": str(e)}), 500
 
-        @self.app.route('/api/architect/decommission-candidates', methods=['GET'])
-        def architect_decommission_candidates():
-            """Get objects marked for decommission."""
-            try:
-                candidates = self.architect_agent.get_decommission_candidates()
-                return jsonify({
-                    "count": len(candidates),
-                    "candidates": candidates,
-                    "timestamp": datetime.now().isoformat()
-                })
             except Exception as e:
-                logger.error(f"Decommission candidates failed: {e}")
-                return jsonify({"error": str(e)}), 500
-
-        @self.app.route('/api/architect/critical-objects', methods=['GET'])
-        def architect_critical_objects():
-            """Get all CRITICAL priority objects for Ops/FinOps focus."""
-            try:
-                critical = self.architect_agent.get_critical_objects()
-                return jsonify({
-                    "count": len(critical),
-                    "critical_objects": critical,
-                    "timestamp": datetime.now().isoformat()
-                })
-            except Exception as e:
-                logger.error(f"Critical objects fetch failed: {e}")
+                logger.error(f"Gemini architect agent failed: {e}")
                 return jsonify({"error": str(e)}), 500
 
         # ==== ADK Architect Workflow ====
@@ -1167,6 +1980,10 @@ class SyncFlowApp:
         @self.app.route('/api/architect/workflows/<object_id>/decision', methods=['POST'])
         def apply_adk_architect_decision(object_id: str):
             """Apply an architect decision via the ADK workflow helpers."""
+            if not self._request_has_architect_role():
+                logger.warning("Rejected SCD2 update for %s due to missing architect role", object_id)
+                return jsonify({"error": "Architect role required to modify SCD2 inventory"}), 403
+
             data = request.get_json()
             if not data:
                 return jsonify({"error": "Request body required"}), 400
@@ -1468,7 +2285,11 @@ class SyncFlowApp:
 def main():
     """Main entry point."""
     import argparse
-    from app import AppSettings
+    # Handle both relative and absolute imports for Cloud Run compatibility
+    try:
+        from .app import AppSettings
+    except ImportError:
+        from app import AppSettings
 
     parser = argparse.ArgumentParser(description="SyncFlow GCP Intelligence Backend")
     parser.add_argument('--sa', help='Service account JSON path')

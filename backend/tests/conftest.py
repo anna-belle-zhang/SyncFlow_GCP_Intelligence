@@ -6,7 +6,6 @@ from typing import Callable, Optional
 
 import pytest
 
-from backend.models import ETLObject, ObjectType
 from backend.tests.fakes import (
     FakeBigQueryClient,
     FakeBillingService,
@@ -15,39 +14,43 @@ from backend.tests.fakes import (
 )
 
 
-@pytest.fixture
-def make_etl_object() -> Callable[[str, ObjectType], ETLObject]:
-    """Factory for building ETLObject instances without real GCP dependencies."""
+# Note: ETLObject and EdgeType classes were refactored out of models.py
+# as part of the cleanup - models.py now contains only BigQuery schema definitions.
+# These fixtures are kept for backward compatibility but should be updated
+# to use domain-specific data structures from agents/models_adk.py if needed.
 
-    def _factory(name: str, object_type: ObjectType = ObjectType.FUNCTION) -> ETLObject:
-        return ETLObject(
-            object_id="",
-            object_type=object_type,
-            name=name,
-            metadata={},
-        )
+@pytest.fixture
+def make_etl_object() -> Callable[[str, str], dict]:
+    """Factory for building ETL object dictionaries without real GCP dependencies."""
+
+    def _factory(name: str, object_type: str = "FUNCTION") -> dict:
+        return {
+            "object_id": "",
+            "object_type": object_type,
+            "name": name,
+            "metadata": {},
+        }
 
     return _factory
 
 
 @pytest.fixture
 def make_edge():
-    """Factory for building ETLEdge instances with optional assigned IDs."""
-    from backend.models import ETLEdge, EdgeType
+    """Factory for building ETL edge dictionaries with optional assigned IDs."""
 
     def _factory(
         source_name: str,
         target_name: str,
-        edge_type: EdgeType = EdgeType.DEPENDS_ON,
-    ) -> ETLEdge:
-        return ETLEdge(
-            edge_id=f"{source_name}->{target_name}",
-            source_object_id="",
-            target_object_id="",
-            edge_type=edge_type,
-            source_name=source_name,
-            target_name=target_name,
-        )
+        edge_type: str = "DEPENDS_ON",
+    ) -> dict:
+        return {
+            "edge_id": f"{source_name}->{target_name}",
+            "source_object_id": "",
+            "target_object_id": "",
+            "edge_type": edge_type,
+            "source_name": source_name,
+            "target_name": target_name,
+        }
 
     return _factory
 

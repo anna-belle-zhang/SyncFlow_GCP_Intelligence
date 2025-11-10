@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from flask import Flask
 
-from .api import register_blueprints
-from .core.config import AppSettings
+# Handle both relative and absolute imports for Cloud Run compatibility
+try:
+    from .api import register_blueprints
+    from .core.config import AppSettings
+except ImportError:
+    from app.api import register_blueprints
+    from app.core.config import AppSettings
 
 
 def create_app(
@@ -28,7 +33,10 @@ def create_app(
         except ImportError:
             # Try relative import for running from backend directory
             from ..syncflow_server import SyncFlowApp
-        from .storage.bigquery import BigQueryStorage
+        try:
+            from .storage.bigquery import BigQueryStorage
+        except ImportError:
+            from app.storage.bigquery import BigQueryStorage
 
         legacy_app = SyncFlowApp(settings=app_settings, app=app)
         app.extensions["legacy_app"] = legacy_app

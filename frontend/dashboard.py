@@ -20,6 +20,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from typing import Any
 import os
+from collections import OrderedDict
 
 import uuid
 
@@ -56,6 +57,44 @@ st.markdown("""
 
 OBJECT_ID_TOKEN = re.compile(r"\bOBJ(\d{1,6})\b", re.IGNORECASE)
 BARE_ID_TOKEN = re.compile(r"\b(0\d{2,5})\b")
+OBJECT_OR_DIGIT_TOKEN = re.compile(r"\b(?:OBJ)?\d{1,6}\b", re.IGNORECASE)
+RELATION_VERB_PATTERN = r"(?:add|append|attach|connect|link|insert)"
+ADD_AFTER_PATTERN = re.compile(
+    rf"\b{RELATION_VERB_PATTERN}\b\s+(?P<targets>[A-Za-z0-9_,\s-]+?)\s+after\s+(?P<anchor>[A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+ADD_BEFORE_PATTERN = re.compile(
+    rf"\b{RELATION_VERB_PATTERN}\b\s+(?P<targets>[A-Za-z0-9_,\s-]+?)\s+before\s+(?P<anchor>[A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+NODE_DEF_PATTERN = re.compile(r'^([A-Za-z0-9_]+)\s*\["(.*)"\]\s*$')
+EDGE_DEF_PATTERN = re.compile(r'^([A-Za-z0-9_]+)\s*-->\s*(?:\|([^|]+)\|\s*)?([A-Za-z0-9_]+)\s*$')
+
+ARCHITECT_ALLOWED_ROLES = {"architect", "admin"}
+DEFAULT_USER_ROLE = "viewer"
+
+
+def _normalize_role(value: str | None) -> str:
+    if not value:
+        return DEFAULT_USER_ROLE
+    return value.strip().lower() or DEFAULT_USER_ROLE
+
+
+def get_current_user_role() -> str:
+    """Return the current dashboard role (session overrides env)."""
+    role = st.session_state.get("user_role")
+    if role:
+        normalized = _normalize_role(role)
+        st.session_state["user_role"] = normalized
+        return normalized
+    env_role = _normalize_role(os.environ.get("SYNCFLOW_USER_ROLE"))
+    st.session_state["user_role"] = env_role
+    return env_role
+
+
+def user_has_architect_role() -> bool:
+    """True when current user can modify architect/SCD2 resources."""
+    return get_current_user_role() in ARCHITECT_ALLOWED_ROLES
 
 
 def normalize_object_id(raw: str | None) -> str | None:
@@ -92,6 +131,80 @@ def extract_object_id_from_text(text: str | None) -> str | None:
     return None
 
 
+def ensure_object_lookup(dashboard: "SyncFlowDashboard") -> None:
+    """Populate object/name lookups so diagrams can display friendly labels."""
+    if st.session_state.get('architect_object_lookup'):
+        return
+
+    data = dashboard.get_objects()
+    if not data or 'objects' not in data:
+        return
+
+    object_lookup: dict[str, str] = {}
+    name_lookup: dict[str, str] = {}
+    for obj in data['objects']:
+        obj_id = (obj.get('object_id') or "").strip()
+        name = (obj.get('name') or "").strip()
+        if obj_id:
+            object_lookup[obj_id.upper()] = name
+        if obj_id and name:
+            name_lookup[name.lower()] = obj_id.upper()
+
+    if object_lookup:
+        st.session_state['architect_object_lookup'] = object_lookup
+        st.session_state['architect_name_lookup'] = name_lookup
+
+
+def get_object_display_name(object_id: str, dashboard: "SyncFlowDashboard | None" = None) -> str | None:
+    """Return cached display name for an object, optionally fetching from backend."""
+    canonical = (object_id or "").strip().upper()
+    if not canonical:
+        return None
+
+    lookup = st.session_state.get('architect_object_lookup', {}) or {}
+    name = lookup.get(canonical)
+    if name:
+        return name
+
+    detail = None
+    if dashboard:
+        try:
+            detail = dashboard.get_object_details(canonical)
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                st.warning(f"Unable to fetch details for {canonical}: {exc}")
+        except Exception as exc:
+            st.warning(f"Unable to fetch details for {canonical}: {exc}")
+
+    if detail:
+        candidate = detail.get("name") or detail.get("object_name") or detail.get("display_name")
+        if not candidate:
+            metadata = detail.get("metadata")
+            if isinstance(metadata, dict):
+                candidate = metadata.get("name")
+        if candidate:
+            lookup[canonical] = candidate
+            st.session_state['architect_object_lookup'] = lookup
+            return candidate
+
+    return None
+
+
+def extract_object_ids(text: str | None) -> list[str]:
+    """Return ordered, deduplicated OBJ identifiers found in text."""
+    if not text:
+        return []
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in OBJECT_OR_DIGIT_TOKEN.findall(text):
+        normalized = normalize_object_id(raw)
+        if normalized and normalized not in seen:
+            ordered.append(normalized)
+            seen.add(normalized)
+    return ordered
+
+
 def render_mermaid_diagram(diagram_text: str, title: str = "Diagram"):
     """Render a mermaid diagram with both code and visualization using Mermaid CDN.
 
@@ -106,12 +219,13 @@ def render_mermaid_diagram(diagram_text: str, title: str = "Diagram"):
         # Replace \n with space in object labels (e.g., OBJ0002\nminietl-daily-extraction -> OBJ0002 minietl-daily-extraction)
         diagram_text_display = diagram_text.replace('\\n', ' ')
 
-        # Show the raw Mermaid code (for users to copy/edit)
-        with st.expander("📄 Show Mermaid Code", expanded=False):
-            st.code(diagram_text, language="mermaid")
-
         # Generate unique ID for this diagram
         diagram_id = f"mermaid_{uuid.uuid4().hex[:8]}"
+
+        # Optional raw code view without nesting expanders
+        toggle_key = f"{diagram_id}_code"
+        if st.checkbox("📄 Show Mermaid Code", key=toggle_key, value=False):
+            st.code(diagram_text, language="mermaid")
 
         # Render the visual diagram using Mermaid.js with components.html()
         mermaid_html = f"""
@@ -302,9 +416,12 @@ def summarize_doc_agent_response(object_id: str, prompt: str | None, payload: di
 class SyncFlowDashboard:
     """Dashboard interface for SyncFlow backend."""
 
-    def __init__(self, api_url: str = "http://127.0.0.1:5000"):
+    def __init__(self, api_url: str = "http://127.0.0.1:5000", user_role: str | None = None):
         self.api_url = api_url
         self.session = requests.Session()
+        resolved_role = _normalize_role(user_role or st.session_state.get("user_role") or os.environ.get("SYNCFLOW_USER_ROLE"))
+        self.user_role = resolved_role
+        self.session.headers.update({"X-Syncflow-Role": self.user_role})
 
     def get_health(self):
         """Check backend health."""
@@ -338,8 +455,15 @@ class SyncFlowDashboard:
             response = self.session.get(f"{self.api_url}/api/objects/{object_id}", timeout=10)
             response.raise_for_status()
             return response.json()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 404:
+                st.info(f"Object `{object_id}` was not found in inventory.")
+                return None
+            st.error(f"Error fetching object {object_id}: {exc}")
+            return None
         except Exception as e:
-            st.error(f"Error fetching object: {e}")
+            st.error(f"Error fetching object {object_id}: {e}")
             return None
 
     def get_object_history(self, object_id: str):
@@ -348,8 +472,15 @@ class SyncFlowDashboard:
             response = self.session.get(f"{self.api_url}/api/objects/{object_id}/history", timeout=10)
             response.raise_for_status()
             return response.json()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 404:
+                st.info(f"No history found for `{object_id}`.")
+                return None
+            st.error(f"Error fetching history for {object_id}: {exc}")
+            return None
         except Exception as e:
-            st.error(f"Error fetching history: {e}")
+            st.error(f"Error fetching history for {object_id}: {e}")
             return None
 
     def get_lineage_upstream(self, object_id: str):
@@ -697,27 +828,147 @@ def parse_architect_commands(command_text: str):
     return parsed
 
 
-def build_mermaid_from_path(path_text: str) -> str | None:
-    """Convert a simple arrow-separated path into a Mermaid flowchart."""
+def _parse_relation_segments(text: str) -> list[list[str]]:
+    """Extract object sequences implied by relation phrases (after/before)."""
+    segments: list[list[str]] = []
+
+    for match in ADD_AFTER_PATTERN.finditer(text):
+        anchor_raw = match.group("anchor").strip(" ,.;")
+        anchor = normalize_object_id(anchor_raw)
+        targets = extract_object_ids(match.group("targets"))
+        if not anchor or not targets:
+            continue
+        for target in targets:
+            segments.append([anchor, target])
+
+    for match in ADD_BEFORE_PATTERN.finditer(text):
+        anchor_raw = match.group("anchor").strip(" ,.;")
+        anchor = normalize_object_id(anchor_raw)
+        targets = extract_object_ids(match.group("targets"))
+        if not anchor or not targets:
+            continue
+        for target in targets:
+            segments.append([target, anchor])
+
+    return segments
+
+
+def _parse_arrow_segments(text: str) -> list[list[str]]:
+    """Extract object sequences expressed with arrow separators."""
+    segments: list[list[str]] = []
+    normalized = re.sub(r'\s*(?:->|→|⇒|to)\s*', '->', text, flags=re.IGNORECASE)
+    raw_segments = [
+        segment.strip()
+        for segment in re.split(r'[;\n]+', normalized)
+        if segment.strip()
+    ]
+    for raw_segment in raw_segments:
+        tokens = [token.strip() for token in raw_segment.split('->') if token.strip()]
+        if len(tokens) >= 2:
+            segments.append(tokens)
+    return segments
+
+
+def _extract_path_segments(text: str) -> list[list[str]]:
+    """Combine relation-based and arrow-based sequences from instructions."""
+    segments, _ = _extract_path_segments_with_metadata(text)
+    return segments
+
+
+def _extract_path_segments_with_metadata(text: str) -> tuple[list[list[str]], bool]:
+    """Return parsed path segments and whether relation keywords were used."""
+    segments = _parse_relation_segments(text)
+    relation_detected = bool(segments)
+    segments.extend(_parse_arrow_segments(text))
+    if not segments:
+        fallback = extract_object_ids(text)
+        if len(fallback) >= 2:
+            segments.append(fallback)
+    return segments, relation_detected
+
+
+def _canonical_node_id(raw_id: str | None) -> str | None:
+    if not raw_id:
+        return None
+    cleaned = re.sub(r'\W+', '_', raw_id.strip())
+    if not cleaned:
+        return None
+    canonical = cleaned.upper()
+    if canonical.startswith("0BJ"):
+        canonical = "OBJ" + canonical[3:]
+    return canonical
+
+
+def _score_label(label: str) -> tuple[int, int]:
+    return (1 if '\\n' in label else 0, len(label))
+
+
+def _parse_mermaid_structure(text: str | None):
+    direction = None
+    nodes: "OrderedDict[str, dict[str, str]]" = OrderedDict()
+    edges: "OrderedDict[tuple[str, str], dict[str, str | None]]" = OrderedDict()
+    extras: list[str] = []
+
+    if not text:
+        return direction, nodes, edges, extras
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith("flowchart"):
+            parts = line.split()
+            if len(parts) > 1:
+                direction = parts[1].upper()
+            continue
+
+        node_match = NODE_DEF_PATTERN.match(line)
+        if node_match:
+            node_id_raw, label = node_match.groups()
+            node_id = _canonical_node_id(node_id_raw)
+            if not node_id:
+                continue
+            existing = nodes.get(node_id)
+            if not existing or _score_label(label) > _score_label(existing["label"]):
+                nodes[node_id] = {"label": label}
+            continue
+
+        edge_match = EDGE_DEF_PATTERN.match(line)
+        if edge_match:
+            src_raw, label_text, tgt_raw = edge_match.groups()
+            src = _canonical_node_id(src_raw)
+            tgt = _canonical_node_id(tgt_raw)
+            if not src or not tgt:
+                continue
+            key = (src, tgt)
+            label_clean = label_text.strip() if label_text else None
+            existing = edges.get(key)
+            if not existing or (label_clean and not existing.get("label")):
+                edges[key] = {"label": label_clean}
+            continue
+
+        if line not in extras:
+            extras.append(line)
+
+    return direction, nodes, edges, extras
+
+
+def build_mermaid_from_path(path_text: str, dashboard: "SyncFlowDashboard | None" = None) -> str | None:
+    """Convert arrow syntax or natural-language cues into a Mermaid flowchart."""
     if not path_text:
         return None
 
-    normalized = re.sub(r'\s*(?:->|→|⇒|to)\s*', '->', path_text, flags=re.IGNORECASE)
-
-    tokens = [
-        token.strip()
-        for token in re.split(r'->', normalized)
-        if token.strip()
-    ]
-
-    if len(tokens) < 2:
+    segments = _extract_path_segments(path_text)
+    if not segments:
         return None
 
     object_lookup = st.session_state.get('architect_object_lookup', {}) or {}
     name_lookup = st.session_state.get('architect_name_lookup', {}) or {}
 
     node_map: dict[str, tuple[str, str]] = {}
-    resolved_sequence: list[str] = []
+    edges: list[tuple[str, str]] = []
+    seen_edges: set[tuple[str, str]] = set()
 
     def resolve_identifier(raw: str) -> tuple[str | None, str | None, str | None]:
         stripped = raw.strip()
@@ -741,7 +992,7 @@ def build_mermaid_from_path(path_text: str) -> str | None:
         if not node_id:
             node_id = re.sub(r'\W+', '_', upper) or f"NODE_{len(node_map) + 1}"
 
-        display_name = object_lookup.get(canonical)
+        display_name = object_lookup.get(canonical) or get_object_display_name(canonical, dashboard)
         if display_name:
             label_text = f"{canonical}\\n{display_name}"
         elif canonical != stripped:
@@ -752,29 +1003,83 @@ def build_mermaid_from_path(path_text: str) -> str | None:
         safe_label = label_text.replace('"', '\\"')
         return canonical, node_id, safe_label
 
-    for token in tokens:
-        canonical, node_id, label = resolve_identifier(token)
-        if not canonical or not node_id or not label:
-            continue
-        resolved_sequence.append(canonical)
-        if canonical not in node_map:
-            node_map[canonical] = (node_id, label)
+    for sequence in segments:
+        resolved_sequence: list[str] = []
+        for token in sequence:
+            canonical, node_id, label = resolve_identifier(token)
+            if not canonical or not node_id or not label:
+                continue
+            resolved_sequence.append(canonical)
+            if canonical not in node_map:
+                node_map[canonical] = (node_id, label)
 
-    if len(node_map) < 2:
+        if len(resolved_sequence) < 2:
+            continue
+
+        for idx in range(len(resolved_sequence) - 1):
+            src = node_map.get(resolved_sequence[idx])
+            tgt = node_map.get(resolved_sequence[idx + 1])
+            if not src or not tgt:
+                continue
+            edge = (src[0], tgt[0])
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            edges.append(edge)
+
+    if len(node_map) < 2 or not edges:
         return None
 
     lines = ["flowchart TD"]
     for _, (node_id, label) in node_map.items():
         lines.append(f'{node_id}["{label}"]')
 
-    for idx in range(len(resolved_sequence) - 1):
-        src = node_map.get(resolved_sequence[idx])
-        tgt = node_map.get(resolved_sequence[idx + 1])
-        if not src or not tgt:
-            continue
-        lines.append(f"{src[0]} --> {tgt[0]}")
+    for src_id, tgt_id in edges:
+        lines.append(f"{src_id} --> {tgt_id}")
 
     return "\n".join(lines) if len(lines) > 1 else None
+
+
+def merge_mermaid_diagrams(base_text: str | None, addition_text: str | None) -> str:
+    """Merge two Mermaid snippets, normalizing identifiers and deduplicating nodes/edges."""
+
+    base_dir, base_nodes, base_edges, base_extras = _parse_mermaid_structure(base_text)
+    add_dir, add_nodes, add_edges, add_extras = _parse_mermaid_structure(addition_text)
+
+    direction = base_dir or add_dir or "TD"
+
+    merged_nodes: "OrderedDict[str, dict[str, str]]" = OrderedDict(base_nodes)
+    for node_id, data in add_nodes.items():
+        existing = merged_nodes.get(node_id)
+        if not existing:
+            merged_nodes[node_id] = data
+        elif _score_label(data["label"]) > _score_label(existing["label"]):
+            merged_nodes[node_id] = data
+
+    merged_edges: "OrderedDict[tuple[str, str], dict[str, str | None]]" = OrderedDict(base_edges)
+    for key, data in add_edges.items():
+        existing = merged_edges.get(key)
+        if not existing or (data.get("label") and not existing.get("label")):
+            merged_edges[key] = data
+
+    extra_lines = list(base_extras)
+    for line in add_extras:
+        if line not in extra_lines:
+            extra_lines.append(line)
+
+    lines = [f"flowchart {direction}"]
+    for node_id, data in merged_nodes.items():
+        label = data["label"]
+        lines.append(f'{node_id}["{label}"]')
+
+    for (src, tgt), data in merged_edges.items():
+        if data.get("label"):
+            lines.append(f"{src} -->|{data['label']}| {tgt}")
+        else:
+            lines.append(f"{src} --> {tgt}")
+
+    lines.extend(extra_lines)
+    return "\n".join(lines)
 
 
 def render_header():
@@ -789,7 +1094,7 @@ def render_header():
         st.markdown("*Making Complex GCP Systems Simple Through Multi-Agent Intelligence*")
 
     with col2:
-        dashboard = SyncFlowDashboard(api_url=get_api_url())
+        dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
         health = dashboard.get_health()
 
         if health:
@@ -810,7 +1115,7 @@ def render_header():
 def render_home_page():
     """Render home page with system overview aligned with CLAUDE.md."""
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
 
     # The Problem
     st.markdown("## The Problem")
@@ -951,7 +1256,7 @@ def render_home_page():
 
 def render_object_browser():
     """Render object browser page with Architect prioritization features."""
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
     data = dashboard.get_objects()
 
     if not data or 'objects' not in data:
@@ -1030,7 +1335,8 @@ def render_object_details(object_id: str):
     """Render detailed object view."""
     st.markdown(f"## Object: {object_id}")
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
+    can_edit = user_has_architect_role()
 
     # Get object details for header display
     obj = dashboard.get_object_details(object_id)
@@ -1070,6 +1376,8 @@ def render_object_details(object_id: str):
     with tab1:
         st.markdown("### 🏗️ Architect Review & Prioritization")
         st.markdown("Architect Agent analysis for inventory management and focus areas")
+        if not can_edit:
+            st.info("Read-only mode: only the Architect role can update SCD2 inventory. Switch roles in the sidebar if you have approval.")
 
         col1, col2 = st.columns(2)
 
@@ -1078,7 +1386,8 @@ def render_object_details(object_id: str):
             priority = st.selectbox(
                 "Object Priority (for Ops/FinOps focus)",
                 options=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
-                help="CRITICAL: Immediate ops/finops attention | HIGH: Regular monitoring | LOW: Background tasks"
+                help="CRITICAL: Immediate ops/finops attention | HIGH: Regular monitoring | LOW: Background tasks",
+                disabled=not can_edit,
             )
 
             if priority == "CRITICAL":
@@ -1093,30 +1402,37 @@ def render_object_details(object_id: str):
             is_decommission = st.checkbox(
                 "Mark for Decommission",
                 value=False,
-                help="Check if this object is identified as technical debt and should be removed/consolidated"
+                help="Check if this object is identified as technical debt and should be removed/consolidated",
+                disabled=not can_edit,
             )
 
+            decomm_reason_value = ""
             if is_decommission:
                 st.error("🗑️ This object is marked for decommission/removal")
-                decomm_reason = st.text_input(
+                decomm_reason_value = st.text_input(
                     "Reason for decommission",
-                    placeholder="e.g., Replaced by new pipeline, no longer needed, consolidating services..."
+                    placeholder="e.g., Replaced by new pipeline, no longer needed, consolidating services...",
+                    disabled=not can_edit,
+                    key=f"decomm_reason_{object_id}",
                 )
+            else:
+                decomm_reason_value = ""
 
         st.markdown("#### Architect's Notes")
         architect_notes = st.text_area(
             "Add notes for Ops and FinOps teams",
             placeholder="Examples:\n- CRITICAL: This is our main user pipeline, any slowdown impacts revenue\n- HIGH: Monitor daily costs, investigate spikes\n- LOW: Legacy pipeline, candidate for consolidation\n- DECOMMISSION: Replaced by new_pipeline_v2, can be removed after 2025-12-31",
-            height=150
+            height=150,
+            disabled=not can_edit,
+            key=f"architect_notes_{object_id}",
         )
 
         # Save button
-        if st.button("💾 Update Inventory", key="update_architect_priority"):
-            decomm_reason = st.session_state.get("decomm_reason", "")
+        if can_edit and st.button("💾 Update Inventory", key=f"update_architect_priority_{object_id}", disabled=not can_edit):
             result = dashboard.apply_architect_decision(
                 object_id,
                 priority=priority,
-                decommission_reason=decomm_reason if is_decommission else None,
+                decommission_reason=decomm_reason_value if is_decommission else None,
                 notes=architect_notes,
                 architect_name="dashboard_user"
             )
@@ -1206,7 +1522,7 @@ def render_agent_workbench():
         fact tables powering performance and cost insights."""
     )
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
 
     tabs = st.tabs([
         "Architect Agent",
@@ -1308,7 +1624,7 @@ def render_agent_analysis(agent_data):
     agent_name = agent_name_map.get(raw_agent_name, raw_agent_name)
     analysis_type = agent_data.get('analysis_type', '')
 
-    def render_shared_arch_context(agent_data):
+    def render_shared_arch_context(agent_data, show_portfolio_costs: bool = True):
         context_rows = agent_data.get("object_context") or []
         if context_rows:
             context_df = pd.DataFrame(context_rows)
@@ -1367,15 +1683,15 @@ def render_agent_analysis(agent_data):
                 st.write("Edges")
                 st.dataframe(edge_df, use_container_width=True, hide_index=True)
 
-        if diagram_history:
-            hist_df = pd.DataFrame(diagram_history)
-            columns = [col for col in ["diagram_id", "diagram_name", "generated_at", "is_active"] if col in hist_df.columns]
-            if columns:
-                st.markdown("### Diagram History")
-                st.dataframe(hist_df[columns], use_container_width=True, hide_index=True)
+            if diagram_history:
+                hist_df = pd.DataFrame(diagram_history)
+                columns = [col for col in ["diagram_id", "diagram_name", "generated_at", "is_active"] if col in hist_df.columns]
+                if columns:
+                    st.markdown("### Diagram History")
+                    st.dataframe(hist_df[columns], use_container_width=True, hide_index=True)
 
         portfolio_summary = agent_data.get("portfolio_summary") or []
-        if portfolio_summary:
+        if show_portfolio_costs and portfolio_summary:
             st.markdown("### Portfolio Top Spenders")
             portfolio_df = pd.DataFrame(portfolio_summary)
             display_cols = [
@@ -1393,10 +1709,13 @@ def render_agent_analysis(agent_data):
                 hide_index=True,
             )
 
-    with st.expander(f"**{agent_name}** - {analysis_type}", expanded=True):
+    st.divider()
+    container = st.container()
+    with container:
+        st.markdown(f"### {agent_name} — {analysis_type or 'Analysis'}")
 
         if raw_agent_name == "DocAgent":
-            st.markdown("### Configuration Changes")
+            st.markdown("#### Configuration Changes")
 
             changes = agent_data.get('recent_changes', [])
             if changes:
@@ -1408,7 +1727,7 @@ def render_agent_analysis(agent_data):
             render_shared_arch_context(agent_data)
 
         elif raw_agent_name == "LogAgent":
-            st.markdown("### Performance Analysis")
+            st.markdown("#### Performance & Reliability Overview")
 
             improvement = agent_data.get('trend_improvement_percent', 0)
             if improvement > 0:
@@ -1418,10 +1737,50 @@ def render_agent_analysis(agent_data):
             else:
                 st.info("→ No significant change")
 
+            ops_summary = agent_data.get("ops_summary") or {}
+            diagram_targets = ops_summary.get("diagram_targets") or []
+            if diagram_targets:
+                st.caption(f"Lineage focus: {', '.join(diagram_targets[:5])}")
+            callouts = ops_summary.get("callouts") or []
+            if callouts:
+                cols = st.columns(min(3, len(callouts)))
+                for col, callout in zip(cols, callouts[:len(cols)]):
+                    severity = callout.get("severity", "info")
+                    message = callout.get("message", "")
+                    with col:
+                        if severity == "danger":
+                            st.error(message)
+                        elif severity == "warning":
+                            st.warning(message)
+                        elif severity == "success":
+                            st.success(message)
+                        else:
+                            st.info(message)
+
+            perf_snapshot = ops_summary.get("performance") or {}
+            if perf_snapshot:
+                st.markdown("##### Performance Snapshot")
+                m1, m2, m3, m4 = st.columns(4)
+                avg_duration = perf_snapshot.get("avg_duration")
+                duration_trend = perf_snapshot.get("duration_trend_pct")
+                throughput_trend = perf_snapshot.get("throughput_trend_pct")
+                with m1:
+                    duration_label = f"{avg_duration:.2f}" if avg_duration is not None else "—"
+                    st.metric("Avg Duration (s)", duration_label)
+                with m2:
+                    trend_label = f"{duration_trend:.1f}%" if duration_trend is not None else "—"
+                    st.metric("Duration Trend", trend_label)
+                with m3:
+                    avg_success = perf_snapshot.get("avg_success_rate_pct")
+                    st.metric("Success Rate", f"{avg_success:.2f}%" if avg_success is not None else "—")
+                with m4:
+                    throughput_label = f"{throughput_trend:.1f}%" if throughput_trend is not None else "—"
+                    st.metric("Throughput Trend", throughput_label)
+
             # Portfolio summary (top executions by object)
             portfolio_summary = agent_data.get("portfolio_summary") or []
             if portfolio_summary:
-                st.markdown("**Top Executed Objects**")
+                st.markdown("##### Top Executed Objects")
                 portfolio_df = pd.DataFrame(portfolio_summary)
                 display_cols = [
                     col for col in [
@@ -1439,14 +1798,11 @@ def render_agent_analysis(agent_data):
                     use_container_width=True,
                     hide_index=True,
                 )
-            else:
-                st.info("No portfolio data available")
 
             # Daily execution metrics (runs per day, duration trends, anomalies)
-            st.markdown("**Daily Execution Metrics**")
+            st.markdown("##### Daily Execution Metrics")
             metrics = agent_data.get('daily_metrics', [])
 
-            # Debug: show what we have
             if not metrics:
                 st.warning("⚠️ No daily metrics returned from Ops Agent")
                 st.info("Check: Did you specify an object_id? Portfolio view may be limited.")
@@ -1472,7 +1828,11 @@ def render_agent_analysis(agent_data):
                         "max_duration",
                         "total_rows",
                         "avg_throughput",
+                        "success_rate_pct",
+                        "failure_rate_pct",
+                        "sigma_level",
                         "performance_status",
+                        "sla_breach",
                     ] if col in metrics_df.columns
                 ]
                 st.dataframe(
@@ -1481,54 +1841,155 @@ def render_agent_analysis(agent_data):
                     hide_index=True,
                 )
 
-            # Show architecture context with Mermaid diagram (helps understand dependencies)
-            st.markdown("**Architecture Context** (for dependency analysis)")
-            context_rows = agent_data.get("object_context") or []
-            if context_rows:
-                context_df = pd.DataFrame(context_rows)
-                display_cols = [
-                    col for col in [
-                        "object_id",
-                        "object_type",
-                        "name",
-                        "status",
-                        "priority",
-                    ] if col in context_df.columns
-                ]
-                st.dataframe(
-                    context_df[display_cols] if display_cols else context_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            anomalies = (ops_summary.get("anomalies") or []) if ops_summary else []
+            if anomalies:
+                st.markdown("##### 🔍 Anomaly Tracker (2σ+)")
+                anomaly_df = pd.DataFrame(anomalies)
+                st.dataframe(anomaly_df, use_container_width=True, hide_index=True)
 
-            # Show lineage diagram to understand impact
-            diagram_summary = agent_data.get("diagram_summary") or {}
-            if diagram_summary:
-                st.markdown("**Dependency Lineage (Mermaid)**")
-                diagram_text = diagram_summary.get("diagram_text") or ""
-                if diagram_text:
-                    render_mermaid_diagram(diagram_text)
+            reliability = ops_summary.get("reliability") if ops_summary else {}
+            sla = ops_summary.get("sla") if ops_summary else {}
+            if reliability or sla:
+                st.markdown("##### Reliability & SLA")
+                rel_col, sla_col = st.columns(2)
+                with rel_col:
+                    worst = reliability.get("worst_success_rate_pct") if reliability else None
+                    incidents = reliability.get("incidents") if reliability else []
+                    st.metric("Worst Success Rate", f"{worst:.2f}%" if worst is not None else "—")
+                    st.caption(f"Incidents <97%: {len(incidents)}")
+                with sla_col:
+                    target = sla.get("target_seconds") if sla else None
+                    breaches = sla.get("breaches") if sla else []
+                    target_label = f"{target/60:.1f} min" if target else "—"
+                    st.metric("SLA Target", target_label)
+                    st.caption(f"SLA Breaches: {len(breaches)}")
+                if reliability and reliability.get("incidents"):
+                    st.write("Incident log")
+                    rel_df = pd.DataFrame(reliability["incidents"])
+                    st.dataframe(rel_df, use_container_width=True, hide_index=True)
+                if sla and sla.get("breaches"):
+                    st.write("Breach details")
+                    sla_df = pd.DataFrame(sla["breaches"])
+                    st.dataframe(sla_df, use_container_width=True, hide_index=True)
+
+            capacity = ops_summary.get("capacity") if ops_summary else {}
+            if capacity:
+                st.markdown("##### Capacity Forecast")
+                col_a, col_b, col_c = st.columns(3)
+                projected_execs = capacity.get("projected_execs_14d")
+                avg_throughput = capacity.get("avg_throughput")
+                risk_level = capacity.get("risk_level", "stable")
+                trend_pct = capacity.get("trend_percent")
+                with col_a:
+                    label = f"{projected_execs:.1f}" if projected_execs is not None else "—"
+                    st.metric("Projected Execs (14d)", label)
+                with col_b:
+                    throughput_label = f"{avg_throughput:.2f}" if avg_throughput is not None else "—"
+                    st.metric("Avg Throughput", throughput_label)
+                with col_c:
+                    st.metric("Risk Level", risk_level)
+                trend_caption = f"{trend_pct:.1f}%" if trend_pct is not None else "—"
+                st.caption(f"Duration trend: {trend_caption} over lookback window.")
+
+            bottlenecks = ops_summary.get("bottlenecks") if ops_summary else []
+            if bottlenecks:
+                st.markdown("##### Bottleneck Candidates")
+                bottleneck_df = pd.DataFrame(bottlenecks)
+                st.dataframe(bottleneck_df, use_container_width=True, hide_index=True)
+
+            render_shared_arch_context(agent_data, show_portfolio_costs=False)
 
         elif raw_agent_name == "CloudFnOAgent":
-            st.markdown("### Cost Analysis")
+            st.markdown("#### Cost Intelligence & Optimization")
 
-            savings = agent_data.get('savings_opportunity_percent', 0)
+            finops_summary = agent_data.get("finops_summary") or {}
+            callouts = finops_summary.get("callouts") or []
+            if callouts:
+                cols = st.columns(min(3, len(callouts)))
+                for col, callout in zip(cols, callouts[:len(cols)]):
+                    message = callout.get("message", "")
+                    severity = callout.get("severity", "info")
+                    with col:
+                        if severity == "danger":
+                            st.error(message)
+                        elif severity == "warning":
+                            st.warning(message)
+                        elif severity == "success":
+                            st.success(message)
+                        else:
+                            st.info(message)
+
+            totals = finops_summary.get("totals") or {}
+            trend = finops_summary.get("trend") or {}
+            savings_block = finops_summary.get("savings") or {}
+            drivers = finops_summary.get("drivers") or []
+
+            total_cost = totals.get("total_cost")
+            avg_daily_cost = totals.get("avg_daily_cost")
+            mom_change = trend.get("mom_change_pct")
+            yoy_change = trend.get("yoy_change_pct")
+            top_driver = drivers[0] if drivers else {}
+            savings_pct = agent_data.get('savings_opportunity_percent', 0)
             daily_savings = agent_data.get('estimated_daily_savings', 0)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if savings > 0:
-                    st.success(f"💰 Savings: {savings}%")
-                else:
-                    st.info(f"Cost Trend: {savings}%")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            with m1:
+                st.metric("Total Spend", f"${total_cost:,.2f}" if total_cost is not None else "—")
+            with m2:
+                st.metric("Avg Daily Cost", f"${avg_daily_cost:,.2f}" if avg_daily_cost is not None else "—")
+            with m3:
+                mom_label = f"{mom_change:.1f}%" if mom_change is not None else "—"
+                st.metric("MoM Change", mom_label)
+            with m4:
+                yoy_label = f"{yoy_change:.1f}%" if yoy_change is not None else "—"
+                st.metric("YoY Change", yoy_label)
+            with m5:
+                driver_label = f"{top_driver.get('service', '—')} ({top_driver.get('percent_of_total', 0):.1f}%)" if top_driver else "—"
+                st.metric("Top Cost Driver", driver_label)
 
-            with col2:
-                st.metric("Daily Savings", f"${daily_savings:.2f}")
+            s1, s2 = st.columns(2)
+            with s1:
+                if savings_pct > 0:
+                    st.success(f"💰 Potential Savings: {savings_pct}%")
+                else:
+                    st.info(f"Cost Trend: {savings_pct}%")
+            with s2:
+                st.metric("Estimated Daily Savings", f"${daily_savings:.2f}")
+
+            service_breakdown = finops_summary.get("service_breakdown") or []
+            if service_breakdown:
+                st.markdown("##### Service Cost Breakdown")
+                service_df = pd.DataFrame(service_breakdown)
+                st.dataframe(service_df, use_container_width=True, hide_index=True)
 
             cost_data = agent_data.get('cost_data', [])
             if cost_data:
+                st.markdown("##### Daily Cost Trend")
                 cost_df = pd.DataFrame(cost_data)
+                chart_df = cost_df.sort_values("cost_date")
+                trend_cols = ["cost_date", "total_daily_cost", "avg_7day_cost"]
+                trend_subset = chart_df[trend_cols].set_index("cost_date")
+                st.line_chart(trend_subset)
                 st.dataframe(cost_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No billing data returned for this window.")
+
+            opportunities = savings_block.get("opportunities") if savings_block else []
+            if opportunities:
+                st.markdown("##### Savings Opportunities")
+                opp_df = pd.DataFrame(opportunities)
+                st.dataframe(opp_df, use_container_width=True, hide_index=True)
+                st.caption(f"Total potential savings: ${savings_block.get('total_potential', 0):,.2f}")
+
+            recs = finops_summary.get("recommendations") or []
+            if recs:
+                st.markdown("##### Recommended Actions")
+                for rec in recs:
+                    st.write(f"- {rec}")
+
+            monitored = finops_summary.get("monitored_services") or []
+            if monitored:
+                st.caption(f"Monitored GCP services: {', '.join(monitored)}")
 
             render_shared_arch_context(agent_data)
 
@@ -1553,6 +2014,8 @@ def render_architect_agent():
     st.markdown("# 🏗️ Architect Agent")
     st.markdown("**Configuration & Change Management**")
 
+    can_edit_architect = user_has_architect_role()
+
     with st.expander("ℹ️ What does Architect Agent do?", expanded=True):
         st.markdown("""
         - **Detects configuration changes** and lineage modifications across your GCP infrastructure
@@ -1567,8 +2030,10 @@ def render_architect_agent():
 
     st.markdown("---")
     st.markdown("## Architect Agent Workbench")
+    if not can_edit_architect:
+        st.info("You are in read-only mode. Only users with the Architect role can modify SCD2 tables.")
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
 
     # Object Inventory -------------------------------------------------------
     st.markdown("## Object Inventory & Prioritization")
@@ -1590,10 +2055,17 @@ def render_architect_agent():
         key="architect_chat_input",
         placeholder="obj0001 obj0002 critical - promote after incident review\nobj0003 decommission legacy pipeline",
         height=150,
+        disabled=not can_edit_architect,
     )
-    architect_name = st.text_input("Architect name", value="dashboard_user", key="architect_chat_user")
+    architect_name = st.text_input(
+        "Architect name",
+        value="dashboard_user",
+        key="architect_chat_user",
+        disabled=not can_edit_architect,
+        help="Only Architect/Admin roles may submit updates."
+    )
 
-    if st.button("Apply Instructions", key="architect_chat_submit"):
+    if can_edit_architect and st.button("Apply Instructions", key="architect_chat_submit", disabled=not can_edit_architect):
         commands = parse_architect_commands(chat_input)
         if not commands:
             st.warning("No recognizable commands found. Reference object IDs such as OBJ0001 and specify critical/high/low/decommission.")
@@ -1636,6 +2108,7 @@ def render_architect_agent():
     st.divider()
     st.markdown("## Architecture Diagram Builder")
     st.caption("Generate lineage-based diagrams or store custom Mermaid snippets for later reference.")
+    ensure_object_lookup(dashboard)
 
     if 'architect_loaded_history' not in st.session_state:
         st.session_state['architect_loaded_history'] = []
@@ -1790,31 +2263,59 @@ def render_architect_agent():
         "Arrow instructions or architecture advice",
         key="architect_path_instructions",
     )
+    append_default = bool(st.session_state.get('architect_diagram_text_editor', "").strip())
+    append_mode = st.checkbox(
+        "Append to current diagram (keep previous nodes/edges)",
+        value=append_default,
+        key="architect_diagram_append_mode",
+    )
 
     if st.button("Generate Diagram From Path", key="architect_diagram_generate_path"):
         instructions = path_instructions.strip()
         if not instructions:
             st.warning("Provide arrow instructions before generating a diagram.")
         else:
-            normalized = re.sub(r'\s*(?:->|→|⇒|to)\s*', '->', instructions, flags=re.IGNORECASE)
-            tokens = [token.strip() for token in re.split(r'->', normalized) if token.strip()]
-            generated = build_mermaid_from_path(instructions)
+            segments_preview, relation_detected = _extract_path_segments_with_metadata(instructions)
+            generated = build_mermaid_from_path(instructions, dashboard)
             if not generated:
                 st.warning("Unable to generate diagram from the provided instructions.")
             else:
-                st.session_state['architect_diagram_text_editor'] = generated
-                if tokens:
-                    first = tokens[0].upper()
-                    if first.isdigit():
-                        first = f"OBJ{first.zfill(4)}"
-                    st.session_state['architect_suggested_key'] = first
+                current_text = st.session_state.get('architect_diagram_text_editor', "")
+                has_existing = bool(current_text.strip())
+                auto_append = relation_detected and has_existing
+                append_enabled = (append_mode or auto_append) and has_existing
+                if append_enabled:
+                    merged = merge_mermaid_diagrams(current_text, generated)
+                    st.session_state['architect_diagram_text_editor'] = merged
+                    preview_text = merged
+                else:
+                    st.session_state['architect_diagram_text_editor'] = generated
+                    preview_text = generated
+
+                if not append_enabled:
+                    suggested_key = None
+                    for sequence in segments_preview:
+                        for token in sequence:
+                            candidate = normalize_object_id(token)
+                            if candidate:
+                                suggested_key = candidate
+                                break
+                        if suggested_key:
+                            break
+                    if suggested_key:
+                        st.session_state['architect_suggested_key'] = suggested_key
                 st.session_state['architect_latest_status'] = None
                 st.session_state['architect_diagram_name_state'] = st.session_state.get('architect_diagram_name_state') or "Generated Path"
                 if st.session_state.get('architect_suggested_key'):
                     st.info(f"Suggested diagram key: {st.session_state['architect_suggested_key']}. Enter it above before saving or choose your own label.")
-                st.success("Generated diagram preview from instructions. Update or save below if satisfied.")
+                action_msg = "Merged new path into current diagram."
+                if append_enabled and auto_append and not append_mode:
+                    st.info("Auto-append enabled because instructions used add/before/after wording.")
+                if not append_enabled:
+                    action_msg = "Generated diagram preview from instructions."
+                st.success(f"{action_msg} Update or save below if satisfied.")
                 st.markdown("#### Preview")
-                render_mermaid_diagram(generated)
+                render_mermaid_diagram(preview_text)
 
     st.markdown("### Edit Diagram")
     st.caption("Review the current Mermaid definition, apply your changes, then save.")
@@ -1924,7 +2425,7 @@ def render_ops_agent():
     st.markdown("---")
     st.caption("Ask about execution performance. Include an object ID to focus analysis. Example: \"Analyze OBJ0001 execution logs\"")
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
     ops_prompt = st.text_area(
         "Question or instructions",
         key="ops_page_prompt",
@@ -1976,7 +2477,7 @@ def render_finops_agent():
     st.markdown("---")
     st.caption("Ask about costs. Leave blank to see top spenders. Example: \"Show top 5 highest cost objects\"")
 
-    dashboard = SyncFlowDashboard(api_url=get_api_url())
+    dashboard = SyncFlowDashboard(api_url=get_api_url(), user_role=get_current_user_role())
     finops_prompt = st.text_area(
         "Question or instructions",
         key="finops_page_prompt",
@@ -2047,6 +2548,19 @@ def main():
             st.session_state.api_url = env_url
         else:
             st.session_state.api_url = api_url or "http://127.0.0.1:5000"
+
+        st.markdown("### Session Role")
+        role_options = ["viewer", "analyst", "architect", "admin"]
+        current_role = get_current_user_role()
+        default_index = role_options.index(current_role) if current_role in role_options else 0
+        selected_role = st.selectbox(
+            "Choose UI role",
+            role_options,
+            index=default_index,
+            help="Only Architect/Admin roles may update SCD2 tables."
+        )
+        st.session_state["user_role"] = selected_role
+        st.caption("Roles: viewer/analyst (read-only), architect/admin (can update inventory)")
 
     # Render page
     render_header()

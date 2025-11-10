@@ -1,6 +1,10 @@
 """Storage adapters for backend services."""
 
-from .bigquery import BigQueryStorage, StorageError, NotFoundError
+# Handle both relative and absolute imports for Cloud Run compatibility
+try:
+    from .bigquery import BigQueryStorage, StorageError, NotFoundError
+except ImportError:
+    from app.storage.bigquery import BigQueryStorage, StorageError, NotFoundError
 
 __all__ = ["BigQueryStorage", "StorageError", "NotFoundError"]
 

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from flask import Flask
 
-from .health import bp as health_blueprint
-from .objects import bp as objects_blueprint
+# Handle both relative and absolute imports for Cloud Run compatibility
+try:
+    from .health import bp as health_blueprint
+    from .objects import bp as objects_blueprint
+except ImportError:
+    from app.api.health import bp as health_blueprint
+    from app.api.objects import bp as objects_blueprint
 
 
 def register_blueprints(app: Flask) -> None:
